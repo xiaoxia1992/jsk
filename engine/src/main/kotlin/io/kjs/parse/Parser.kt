@@ -475,7 +475,14 @@ class Parser(source: String) {
     private fun callArgs(): List<Expr> {
         eat(T.LPAREN)
         val a = mutableListOf<Expr>()
-        if (!at(T.RPAREN)) do { a.add(assignment()) } while (match(T.COMMA))
+        if (!at(T.RPAREN)) do {
+            if (at(T.ELLIPSIS)) {
+                val tok = eat()
+                a.add(Unary("...", assignment(), true).pos(tok))
+            } else {
+                a.add(assignment())
+            }
+        } while (match(T.COMMA))
         eat(T.RPAREN)
         return a
     }

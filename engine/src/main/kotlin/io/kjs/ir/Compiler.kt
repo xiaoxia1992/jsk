@@ -624,10 +624,46 @@ class Compiler private constructor(
             UndefinedLit -> bytecode.emit(Op.LOAD_UNDEF)
             ThisExpr -> bytecode.emit(Op.GET_THIS)
             is Ident -> emitLoadIdent(e.name, e.line)
-            is ArrayLit -> { e.elements.forEach { if (it != null) compileExpr(it) else bytecode.emit(Op.LOAD_UNDEF) }; bytecode.emit(Op.MAKE_ARRAY, e.elements.size) }
+            is ArrayLit -> {
+                val hasSpread = e.elements.any { it is Unary && it.op == "..." }
+                if (!hasSpread) {
+                    e.elements.forEach { if (it != null) compileExpr(it) else bytecode.emit(Op.LOAD_UNDEF) }
+                    bytecode.emit(Op.MAKE_ARRAY, e.elements.size)
+                } else {
+                    // Build the array element-by-element, handling spreads via concat.
+                    emitBuildArgsArray(e.elements.map { it ?: UndefinedLit })
+                }
+            }
             is ObjectLit -> {
-                for ((k, v) in e.props) { bytecode.emit(Op.LOAD_STR, bytecode.strIdx(k)); compileExpr(v) }
-                bytecode.emit(Op.MAKE_OBJECT, e.props.size)
+                val hasSpread = e.props.any { it.first == "__rest__" }
+                if (!hasSpread) {
+                    for ((k, v) in e.props) { bytecode.emit(Op.LOAD_STR, bytecode.strIdx(k)); compileExpr(v) }
+                    bytecode.emit(Op.MAKE_OBJECT, e.props.size)
+                } else {
+                    // Build via: let o = {}; Object.assign(o, src) for each spread; set own for each regular prop.
+                    bytecode.emit(Op.MAKE_OBJECT, 0)
+                    val slot = declareScratchLocal()
+                    bytecode.emit(Op.STORE_LOCAL, slot); bytecode.emit(Op.POP)
+                    for ((k, v) in e.props) {
+                        if (k == "__rest__") {
+                            // Object.assign(o, src)
+                            val src = (v as Unary).arg
+                            bytecode.emit(Op.LOAD_GLOBAL, bytecode.strIdx("Object"))
+                            bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("assign"))
+                            bytecode.emit(Op.LOAD_LOCAL, slot)
+                            compileExpr(src)
+                            bytecode.emit(Op.CALL, 2)
+                            bytecode.emit(Op.POP)  // discard returned 'o' (same as slot)
+                        } else {
+                            // o[k] = v
+                            bytecode.emit(Op.LOAD_LOCAL, slot)
+                            compileExpr(v)
+                            bytecode.emit(Op.STORE_PROP, bytecode.strIdx(k))
+                            bytecode.emit(Op.POP)
+                        }
+                    }
+                    bytecode.emit(Op.LOAD_LOCAL, slot)
+                }
             }
             is FunctionExpr -> {
                 val fnBc = compileFunction(e.name ?: "", e.params, e.body, isArrow = false)
@@ -864,19 +900,84 @@ class Compiler private constructor(
     }
 
     private fun compileCall(e: Call) {
+        val hasSpread = e.args.any { it is Unary && it.op == "..." }
         if (e.callee is Member) {
-            // Method call: obj, fn, args... -> CALL_METHOD keeps obj as `this`.
             val m = e.callee
             compileExpr(m.obj); bytecode.emit(Op.DUP)       // obj, obj
             if (m.computed) { compileExpr(m.computedExpr!!); bytecode.emit(Op.LOAD_ELEM) }
             else bytecode.emit(Op.LOAD_PROP, bytecode.strIdx(m.prop))   // obj, fn
-            for (a in e.args) compileExpr(a)
-            bytecode.emit(Op.CALL_METHOD, e.args.size, 0, e.line)
+            if (hasSpread) {
+                // Stack: obj, fn.  Need: fn.apply(obj, argsArr).
+                val fnSlot = declareScratchLocal()
+                bytecode.emit(Op.STORE_LOCAL, fnSlot); bytecode.emit(Op.POP)  // obj
+                val objSlot = declareScratchLocal()
+                bytecode.emit(Op.STORE_LOCAL, objSlot); bytecode.emit(Op.POP) // <empty>
+                // Build args array
+                emitBuildArgsArray(e.args)
+                val argsSlot = declareScratchLocal()
+                bytecode.emit(Op.STORE_LOCAL, argsSlot); bytecode.emit(Op.POP)
+                // fn.apply(obj, argsArr)
+                bytecode.emit(Op.LOAD_LOCAL, fnSlot); bytecode.emit(Op.DUP)
+                bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("apply"))
+                bytecode.emit(Op.LOAD_LOCAL, objSlot)
+                bytecode.emit(Op.LOAD_LOCAL, argsSlot)
+                bytecode.emit(Op.CALL_METHOD, 2, 0, e.line)
+            } else {
+                for (a in e.args) compileExpr(a)
+                bytecode.emit(Op.CALL_METHOD, e.args.size, 0, e.line)
+            }
         } else {
             compileExpr(e.callee)
-            for (a in e.args) compileExpr(a)
-            bytecode.emit(Op.CALL, e.args.size, 0, e.line)
+            if (hasSpread) {
+                // Stack: fn.  Call fn.apply(undefined, argsArr).
+                val fnSlot = declareScratchLocal()
+                bytecode.emit(Op.STORE_LOCAL, fnSlot); bytecode.emit(Op.POP)
+                emitBuildArgsArray(e.args)                      // argsArr
+                val argsSlot = declareScratchLocal()
+                bytecode.emit(Op.STORE_LOCAL, argsSlot); bytecode.emit(Op.POP)
+                bytecode.emit(Op.LOAD_LOCAL, fnSlot); bytecode.emit(Op.DUP)
+                bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("apply"))
+                bytecode.emit(Op.LOAD_UNDEF)
+                bytecode.emit(Op.LOAD_LOCAL, argsSlot)
+                bytecode.emit(Op.CALL_METHOD, 2, 0, e.line)
+            } else {
+                for (a in e.args) compileExpr(a)
+                bytecode.emit(Op.CALL, e.args.size, 0, e.line)
+            }
         }
+    }
+
+    /**
+     * Build an Array out of the argument list, handling any `...expr` spread entries.
+     * Emits bytecode that leaves the resulting JsArray on top of the stack.
+     *
+     * Strategy: store the in-progress array into a scratch local, then for each arg
+     * either `arr.push(value)` or `arr = arr.concat(spread)`.
+     */
+    private fun emitBuildArgsArray(args: List<Expr>) {
+        val arrSlot = declareScratchLocal()
+        bytecode.emit(Op.MAKE_ARRAY, 0)
+        bytecode.emit(Op.STORE_LOCAL, arrSlot); bytecode.emit(Op.POP)
+        for (a in args) {
+            if (a is Unary && a.op == "...") {
+                // arr = arr.concat(iter)
+                bytecode.emit(Op.LOAD_LOCAL, arrSlot)
+                bytecode.emit(Op.DUP)
+                bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("concat"))
+                compileExpr(a.arg)
+                bytecode.emit(Op.CALL_METHOD, 1)
+                bytecode.emit(Op.STORE_LOCAL, arrSlot); bytecode.emit(Op.POP)
+            } else {
+                // arr.push(value)
+                bytecode.emit(Op.LOAD_LOCAL, arrSlot)
+                bytecode.emit(Op.DUP)
+                bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("push"))
+                compileExpr(a)
+                bytecode.emit(Op.CALL_METHOD, 1)
+                bytecode.emit(Op.POP)   // discard push's return (length)
+            }
+        }
+        bytecode.emit(Op.LOAD_LOCAL, arrSlot)
     }
 
     private fun compileNew(e: NewExpr) {
