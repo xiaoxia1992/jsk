@@ -13,7 +13,13 @@ sealed class Stmt : Node()
 class Block(val body: List<Stmt>) : Stmt()
 class ExprStmt(val expr: Expr) : Stmt()
 class VarDecl(val kind: String /* var/let/const */, val declarators: List<Declarator>) : Stmt()
-class Declarator(val name: String, val init: Expr?) : Node()
+/**
+ * `target` is either a plain string (identifier binding — [name]) or a [Pattern]
+ * (destructuring). Exactly one is non-null.
+ */
+class Declarator(val name: String?, val pattern: Pattern?, val init: Expr?) : Node() {
+    constructor(name: String, init: Expr?) : this(name, null, init)
+}
 class If(val test: Expr, val cons: Stmt, val alt: Stmt?) : Stmt()
 class While(val test: Expr, val body: Stmt) : Stmt()
 class DoWhile(val body: Stmt, val test: Expr) : Stmt()
@@ -28,6 +34,24 @@ class Try(val block: Block, val catchParam: String?, val catchBody: Block?, val 
 class FunctionDecl(val name: String, val params: List<String>, val body: Block) : Stmt()
 class EmptyStmt : Stmt()
 class Labeled(val label: String, val body: Stmt) : Stmt()
+
+// --- Destructuring patterns ---
+/**
+ * Destructuring targets. A Pattern can be used wherever an identifier used to go
+ * in a binding position (var decl, parameter) and in the LHS of an assignment.
+ *
+ *  - IdentPattern : plain binding, possibly with a default value
+ *  - ArrayPattern : `[a, b = 1, ...rest]`
+ *  - ObjectPattern: `{a, b: c, d = 1, ...rest}`
+ *  - AssignTargetPattern: already-assignable Expr (Member or Ident) used as target
+ */
+sealed class Pattern : Node()
+class IdentPattern(val name: String, val default: Expr? = null) : Pattern()
+class ArrayPattern(val elements: List<Pattern?>, val rest: Pattern? = null) : Pattern()
+class ObjectPattern(val props: List<ObjectPatternProp>, val rest: IdentPattern? = null) : Pattern()
+class ObjectPatternProp(val key: String, val value: Pattern, val computed: Boolean = false) : Node()
+/** Used when a complex Expr (Member access, index) is the target of a destructuring assignment. */
+class AssignTargetPattern(val target: Expr, val default: Expr? = null) : Pattern()
 
 // --- Expressions ---
 sealed class Expr : Node()
@@ -53,3 +77,11 @@ class Call(val callee: Expr, val args: List<Expr>) : Expr()
 class NewExpr(val callee: Expr, val args: List<Expr>) : Expr()
 class Sequence(val items: List<Expr>) : Expr()
 class TemplateLit(val raw: String) : Expr()
+
+/**
+ * Destructuring assignment as an expression: `[a, b] = arr` or `({x} = o)`.
+ * Compiler emits a sequence of plain assignments followed by leaving the RHS
+ * value on the stack (ES spec: result of destructuring assignment is the RHS).
+ */
+class DestructuringAssign(val pattern: Pattern, val value: Expr) : Expr()
+

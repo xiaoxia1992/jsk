@@ -106,12 +106,20 @@ class Compiler private constructor(
     /** ES5-style hoisting for var and function decls. Called once per function body. */
     private fun hoistVarAndFunctions(body: List<Stmt>, isTopLevel: Boolean) {
         // First pass: declare var names and function decls as locals (or globals if top-level).
+        fun declareOneVar(name: String) {
+            if (isTopLevel) { /* globals live on env */ }
+            else if (!scope.locals.containsKey(name)) declareLocal(name)
+        }
+        fun declareFromPattern(p: Pattern) {
+            for (n in collectPatternNames(p)) declareOneVar(n)
+        }
+        fun declareFromDeclarator(d: Declarator) {
+            if (d.name != null) declareOneVar(d.name)
+            else if (d.pattern != null) declareFromPattern(d.pattern)
+        }
         fun walk(stmts: List<Stmt>) {
             for (s in stmts) when (s) {
-                is VarDecl -> if (s.kind == "var") for (d in s.declarators) {
-                    if (isTopLevel) { /* top-level vars live on the global env */ }
-                    else if (!scope.locals.containsKey(d.name)) declareLocal(d.name)
-                }
+                is VarDecl -> if (s.kind == "var") for (d in s.declarators) declareFromDeclarator(d)
                 is FunctionDecl -> {
                     if (isTopLevel) { /* handled at emission */ }
                     else if (!scope.locals.containsKey(s.name)) declareLocal(s.name)
@@ -121,7 +129,7 @@ class Compiler private constructor(
                 is While -> walk(listOf(s.body))
                 is DoWhile -> walk(listOf(s.body))
                 is ForC -> {
-                    (s.init as? VarDecl)?.let { if (it.kind == "var") for (d in it.declarators) if (!scope.locals.containsKey(d.name)) declareLocal(d.name) }
+                    (s.init as? VarDecl)?.let { if (it.kind == "var") for (d in it.declarators) declareFromDeclarator(d) }
                     walk(listOf(s.body))
                 }
                 is ForIn -> walk(listOf(s.body))
@@ -199,26 +207,211 @@ class Compiler private constructor(
     private fun compileVarDecl(s: VarDecl) {
         for (d in s.declarators) {
             val isVar = s.kind == "var"
+            if (d.pattern != null) {
+                // Destructuring declaration: push RHS (or undefined), then bind pattern.
+                if (d.init != null) compileExpr(d.init) else bytecode.emit(Op.LOAD_UNDEF)
+                compileBindPattern(d.pattern, s.kind)
+                continue
+            }
+            val name = d.name!!
             val init: Expr? = d.init
             if (init != null) compileExpr(init)
             else if (isVar) continue  // hoisted; no re-init
             else bytecode.emit(Op.LOAD_UNDEF)
 
             if (isVar) {
-                // var can reuse any enclosing local slot in the same function
-                val existing = resolveLocal(d.name)
+                val existing = resolveLocal(name)
                 if (existing != null) {
                     bytecode.emit(Op.STORE_LOCAL, existing); bytecode.emit(Op.POP)
                 } else {
-                    // top-level var -> global
-                    bytecode.emit(Op.DECL_GLOBAL, bytecode.strIdx(d.name))
+                    bytecode.emit(Op.DECL_GLOBAL, bytecode.strIdx(name))
                 }
             } else {
-                // let/const: always a fresh slot in the *current* scope (shadowing outer)
-                val slot = declareLocal(d.name, isConst = (s.kind == "const"))
+                val slot = declareLocal(name, isConst = (s.kind == "const"))
                 bytecode.emit(Op.STORE_LOCAL, slot); bytecode.emit(Op.POP)
             }
         }
+    }
+
+    /**
+     * Bind a destructuring pattern. Consumes one RHS value from the stack.
+     * `kind` is "var", "let", "const" — used to decide how bindings are declared.
+     * For assignment (no declaration), pass `kind = ""`.
+     */
+    private fun compileBindPattern(p: Pattern, kind: String) {
+        when (p) {
+            is IdentPattern -> {
+                // stack: value
+                if (p.default != null) {
+                    // if value === undefined then replace with default
+                    applyDefault(p.default)
+                }
+                bindIdent(p.name, kind)
+            }
+            is AssignTargetPattern -> {
+                if (p.default != null) applyDefault(p.default)
+                // assign to arbitrary target; consumes stack top (leaves value, then POP)
+                compileAssignTargetStoreTopLeaveValue(p.target)
+                bytecode.emit(Op.POP)
+            }
+            is ArrayPattern -> compileBindArrayPattern(p, kind)
+            is ObjectPattern -> compileBindObjectPattern(p, kind)
+        }
+    }
+
+    /** Stack top: value. Replace with `defaultExpr` iff it's strictly undefined. */
+    private fun applyDefault(defaultExpr: Expr) {
+        // if value !== undefined goto KEEP
+        bytecode.emit(Op.DUP)
+        bytecode.emit(Op.LOAD_UNDEF)
+        bytecode.emit(Op.SEQ)
+        val jf = bytecode.emit(Op.JF, -1)   // if NOT undefined, keep existing value
+        // was undefined — drop and replace
+        bytecode.emit(Op.POP)
+        compileExpr(defaultExpr)
+        bytecode.patchA(jf, bytecode.size)
+    }
+
+    /** Introduce / store `name` according to `kind` (top of stack: value). */
+    private fun bindIdent(name: String, kind: String) {
+        when (kind) {
+            "var" -> {
+                val existing = resolveLocal(name)
+                if (existing != null) {
+                    bytecode.emit(Op.STORE_LOCAL, existing); bytecode.emit(Op.POP)
+                } else {
+                    bytecode.emit(Op.DECL_GLOBAL, bytecode.strIdx(name))
+                }
+            }
+            "let", "const" -> {
+                val slot = declareLocal(name, isConst = kind == "const")
+                bytecode.emit(Op.STORE_LOCAL, slot); bytecode.emit(Op.POP)
+            }
+            "" -> {
+                // Assignment form: store into existing binding (local or global).
+                val existing = resolveLocal(name)
+                if (existing != null) {
+                    bytecode.emit(Op.STORE_LOCAL, existing); bytecode.emit(Op.POP)
+                } else {
+                    bytecode.emit(Op.STORE_GLOBAL, bytecode.strIdx(name)); bytecode.emit(Op.POP)
+                }
+            }
+        }
+    }
+
+    /** Store stack top into `target`; leaves the value on stack. (Caller decides to POP or keep.) */
+    private fun compileAssignTargetStoreTopLeaveValue(target: Expr) {
+        when (target) {
+            is Ident -> {
+                val existing = resolveLocal(target.name)
+                if (existing != null) bytecode.emit(Op.STORE_LOCAL, existing)
+                else bytecode.emit(Op.STORE_GLOBAL, bytecode.strIdx(target.name))
+            }
+            is Member -> {
+                // Need obj on stack beneath value: [value] -> [value, obj, value] via DUP
+                // Actually the interpreter expects [obj, value] for STORE_PROP.
+                // Strategy: compute obj first separately.
+                // stack: value
+                compileExpr(target.obj)      // stack: value, obj
+                bytecode.emit(Op.SWAP)       // stack: obj, value
+                if (!target.computed) {
+                    bytecode.emit(Op.STORE_PROP, bytecode.strIdx(target.prop))
+                } else {
+                    // Need [obj, key, value]; we have [obj, value]. Insert key.
+                    // Simpler path: compile key then restore via: obj, value, key → obj, key, value
+                    compileExpr(target.computedExpr!!)  // stack: obj, value, key
+                    bytecode.emit(Op.SWAP)              // obj, key, value
+                    bytecode.emit(Op.STORE_ELEM)
+                }
+            }
+            else -> error("Unsupported assignment target in destructuring: ${target::class.simpleName}")
+        }
+    }
+
+    private fun compileBindArrayPattern(p: ArrayPattern, kind: String) {
+        // Stack: rhs
+        // Store rhs in a fresh scratch local so we can index into it multiple times.
+        val rhsSlot = declareScratchLocal()
+        bytecode.emit(Op.STORE_LOCAL, rhsSlot); bytecode.emit(Op.POP)
+
+        for ((i, el) in p.elements.withIndex()) {
+            if (el == null) continue
+            // rhs[i]
+            bytecode.emit(Op.LOAD_LOCAL, rhsSlot)
+            bytecode.emit(Op.LOAD_INT, i)
+            bytecode.emit(Op.LOAD_ELEM)
+            compileBindPattern(el, kind)
+        }
+
+        if (p.rest != null) {
+            // rest = rhs.slice(n)
+            bytecode.emit(Op.LOAD_LOCAL, rhsSlot)
+            bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("slice"))
+            bytecode.emit(Op.LOAD_LOCAL, rhsSlot)   // this = rhs
+            bytecode.emit(Op.SWAP)                  // stack: rhs, sliceFn
+            bytecode.emit(Op.LOAD_INT, p.elements.size)
+            bytecode.emit(Op.CALL_METHOD, 1)
+            compileBindPattern(p.rest, kind)
+        }
+    }
+
+    private fun compileBindObjectPattern(p: ObjectPattern, kind: String) {
+        // Stack: rhs
+        val rhsSlot = declareScratchLocal()
+        bytecode.emit(Op.STORE_LOCAL, rhsSlot); bytecode.emit(Op.POP)
+
+        for (prop in p.props) {
+            bytecode.emit(Op.LOAD_LOCAL, rhsSlot)
+            bytecode.emit(Op.LOAD_PROP, bytecode.strIdx(prop.key))
+            compileBindPattern(prop.value, kind)
+        }
+
+        if (p.rest != null) {
+            // rest = { ...rhs minus consumed keys }
+            // Emit: Object.assign({}, rhs) then delete consumed keys
+            bytecode.emit(Op.LOAD_GLOBAL, bytecode.strIdx("Object"))
+            bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("assign"))
+            // Stack: assignFn
+            // Need: assignFn(dst, rhs)
+            // MAKE_OBJECT with 0 pairs = {}
+            bytecode.emit(Op.MAKE_OBJECT, 0)       // stack: assignFn, {}
+            bytecode.emit(Op.LOAD_LOCAL, rhsSlot)  // stack: assignFn, {}, rhs
+            bytecode.emit(Op.CALL, 2)              // stack: dst
+            // Now delete consumed keys from dst
+            for (prop in p.props) {
+                bytecode.emit(Op.DUP)
+                bytecode.emit(Op.DELETE_PROP, bytecode.strIdx(prop.key))
+                bytecode.emit(Op.POP)
+            }
+            compileBindPattern(p.rest, kind)
+        }
+    }
+
+    private fun declareScratchLocal(): Int {
+        // Anonymous slot — name it using a counter so it never clashes with user locals.
+        val name = "__destructScratch__${nextSlot}__"
+        return declareLocal(name, isConst = false)
+    }
+
+    /** Collect all identifier binding names from a pattern. Used by hoisting. */
+    private fun collectPatternNames(p: Pattern): List<String> {
+        val out = mutableListOf<String>()
+        fun walk(pat: Pattern) {
+            when (pat) {
+                is IdentPattern -> out.add(pat.name)
+                is ArrayPattern -> {
+                    for (el in pat.elements) if (el != null) walk(el)
+                    pat.rest?.let { walk(it) }
+                }
+                is ObjectPattern -> {
+                    for (pp in pat.props) walk(pp.value)
+                    pat.rest?.let { walk(it) }
+                }
+                is AssignTargetPattern -> { /* target is already bound elsewhere */ }
+            }
+        }
+        walk(p)
+        return out
     }
 
     private fun compileIf(s: If) {
@@ -418,6 +611,15 @@ class Compiler private constructor(
             is Call -> compileCall(e)
             is NewExpr -> compileNew(e)
             is Sequence -> { for ((i, ex) in e.items.withIndex()) { compileExpr(ex); if (i != e.items.lastIndex) bytecode.emit(Op.POP) } }
+            is DestructuringAssign -> {
+                // Evaluate RHS, DUP it (destructuring leaves it on the stack as the
+                // expression's value), then bind into the pattern.
+                compileExpr(e.value)
+                bytecode.emit(Op.DUP)
+                compileBindPattern(e.pattern, kind = "")
+                // After compileBindPattern, the consumed RHS copy is gone; the
+                // original DUP'd value remains as the expression result.
+            }
         }
     }
 

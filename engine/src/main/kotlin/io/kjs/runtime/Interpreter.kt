@@ -50,7 +50,10 @@ class Interpreter(val realm: Realm) {
                 val fn = mkUserFunction(s.name, s.params, s.body, env, isArrow = false)
                 env.declare(s.name, fn)
             }
-            is VarDecl -> if (s.kind == "var") for (d in s.declarators) if (!env.has(d.name)) env.declare(d.name, JsValues.UNDEFINED)
+            is VarDecl -> if (s.kind == "var") for (d in s.declarators) {
+                val name = d.name ?: continue   // destructuring: only bytecode VM supports it
+                if (!env.has(name)) env.declare(name, JsValues.UNDEFINED)
+            }
             is If -> { hoist(env, listOf(s.cons)); s.alt?.let { hoist(env, listOf(it)) } }
             is Block -> hoist(env, s.body)
             is While -> hoist(env, listOf(s.body))
@@ -79,10 +82,12 @@ class Interpreter(val realm: Realm) {
             is ExprStmt -> evalExpr(s.expr, env)
             is VarDecl -> {
                 for (d in s.declarators) {
+                    val name = d.name
+                        ?: throw JsThrown("destructuring declarations only supported on the bytecode VM")
                     val v = if (d.init != null) evalExpr(d.init, env) else JsValues.UNDEFINED
                     if (s.kind == "var") {
-                        if (!env.has(d.name)) env.declare(d.name, v) else env.set(d.name, v)
-                    } else env.declare(d.name, v)
+                        if (!env.has(name)) env.declare(name, v) else env.set(name, v)
+                    } else env.declare(name, v)
                 }
                 null
             }
@@ -223,6 +228,7 @@ class Interpreter(val realm: Realm) {
         is NewExpr -> evalNew(e, env)
         is Sequence -> { var last: Any? = JsValues.UNDEFINED; for (it in e.items) last = evalExpr(it, env); last }
         is TemplateLit -> e.raw
+        is DestructuringAssign -> throw JsThrown("destructuring assignment only supported on the bytecode VM")
     }
 
     private fun evalUnary(e: Unary, env: Environment): Any? = when (e.op) {

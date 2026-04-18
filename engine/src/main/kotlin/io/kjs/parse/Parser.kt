@@ -92,11 +92,131 @@ class Parser(source: String) {
         val kind = tok.value
         val list = mutableListOf<Declarator>()
         do {
-            val n = eat(T.IDENT).value
-            val init = if (match(T.ASSIGN)) assignment() else null
-            list.add(Declarator(n, init).pos(tok))
+            val d = if (at(T.LBRACK) || at(T.LBRACE)) {
+                val pat = bindingPattern()
+                val init = if (match(T.ASSIGN)) assignment() else null
+                Declarator(null, pat, init).pos(tok)
+            } else {
+                val n = eat(T.IDENT).value
+                val init = if (match(T.ASSIGN)) assignment() else null
+                Declarator(n, null, init).pos(tok)
+            }
+            list.add(d)
         } while (match(T.COMMA))
         return VarDecl(kind, list).pos(tok)
+    }
+
+    // --- destructuring patterns ---
+    private fun bindingPattern(): Pattern = when {
+        at(T.LBRACK) -> arrayBindingPattern()
+        at(T.LBRACE) -> objectBindingPattern()
+        else -> {
+            val tok = eat(T.IDENT)
+            val def = if (match(T.ASSIGN)) assignment() else null
+            IdentPattern(tok.value, def).pos(tok)
+        }
+    }
+
+    private fun arrayBindingPattern(): Pattern {
+        val tok = eat(T.LBRACK)
+        val elts = mutableListOf<Pattern?>()
+        var rest: Pattern? = null
+        while (!at(T.RBRACK)) {
+            if (at(T.COMMA)) { elts.add(null); eat(T.COMMA); continue }
+            if (match(T.ELLIPSIS)) {
+                rest = bindingPatternNoDefault()
+                break
+            }
+            elts.add(bindingPattern())
+            if (!at(T.RBRACK)) eat(T.COMMA)
+        }
+        eat(T.RBRACK)
+        return ArrayPattern(elts, rest).pos(tok)
+    }
+
+    private fun objectBindingPattern(): Pattern {
+        val tok = eat(T.LBRACE)
+        val props = mutableListOf<ObjectPatternProp>()
+        var rest: IdentPattern? = null
+        while (!at(T.RBRACE)) {
+            if (match(T.ELLIPSIS)) {
+                val rtok = peek()
+                val rname = eat(T.IDENT).value
+                rest = IdentPattern(rname).pos(rtok)
+                break
+            }
+            val ktok = peek()
+            val key = when (ktok.type) {
+                T.IDENT, T.STRING, T.NUMBER -> eat().value
+                else -> eat(T.IDENT).value
+            }
+            val valuePat: Pattern = if (match(T.COLON)) {
+                bindingPattern()
+            } else {
+                // shorthand: { x } — binding named "x", optional default
+                val def = if (match(T.ASSIGN)) assignment() else null
+                IdentPattern(key, def).pos(ktok)
+            }
+            props.add(ObjectPatternProp(key, valuePat).pos(ktok))
+            if (!at(T.RBRACE)) eat(T.COMMA)
+        }
+        eat(T.RBRACE)
+        return ObjectPattern(props, rest).pos(tok)
+    }
+
+    /** Rest target cannot itself have a default in ES spec. */
+    private fun bindingPatternNoDefault(): Pattern = when {
+        at(T.LBRACK) -> arrayBindingPattern()
+        at(T.LBRACE) -> objectBindingPattern()
+        else -> { val tok = eat(T.IDENT); IdentPattern(tok.value, null).pos(tok) }
+    }
+
+    /**
+     * Convert an already-parsed Expr (which was parsed as a normal expression
+     * because the parser didn't yet know it would be an assignment target) into
+     * a destructuring Pattern.  Used for `[a, b] = arr` and `({a} = obj)`.
+     */
+    private fun exprToPattern(e: Expr): Pattern = when (e) {
+        is Ident -> IdentPattern(e.name).also { it.line = e.line; it.col = e.col }
+        is ArrayLit -> {
+            val items = e.elements
+            val elts = mutableListOf<Pattern?>()
+            var rest: Pattern? = null
+            for ((idx, el) in items.withIndex()) {
+                if (el == null) { elts.add(null); continue }
+                // rest handled via Unary "..." below
+                if (el is Unary && el.op == "..." && idx == items.size - 1) {
+                    rest = exprToPattern(el.arg)
+                } else if (el is Assign && el.op == "=") {
+                    val inner = exprToPattern(el.target)
+                    elts.add(patternWithDefault(inner, el.value))
+                } else {
+                    elts.add(exprToPattern(el))
+                }
+            }
+            ArrayPattern(elts, rest).also { it.line = e.line; it.col = e.col }
+        }
+        is ObjectLit -> {
+            val props = mutableListOf<ObjectPatternProp>()
+            var rest: IdentPattern? = null
+            for ((k, v) in e.props) {
+                if (k == "__rest__") { rest = exprToPattern(v) as IdentPattern; continue }
+                val (valPat, _) = if (v is Assign && v.op == "=") {
+                    exprToPattern(v.target) to v.value
+                } else exprToPattern(v) to null
+                val defAttached = if (v is Assign && v.op == "=") patternWithDefault(valPat, v.value) else valPat
+                props.add(ObjectPatternProp(k, defAttached).also { it.line = e.line; it.col = e.col })
+            }
+            ObjectPattern(props, rest).also { it.line = e.line; it.col = e.col }
+        }
+        is Member -> AssignTargetPattern(e).also { it.line = e.line; it.col = e.col }
+        else -> AssignTargetPattern(e).also { it.line = e.line; it.col = e.col }
+    }
+
+    private fun patternWithDefault(p: Pattern, def: Expr): Pattern = when (p) {
+        is IdentPattern -> IdentPattern(p.name, def).also { it.line = p.line; it.col = p.col }
+        is AssignTargetPattern -> AssignTargetPattern(p.target, def).also { it.line = p.line; it.col = p.col }
+        else -> p   // array/object pattern defaults are wrapped at the caller level
     }
 
     private fun ifStmt(): Stmt {
@@ -130,7 +250,14 @@ class Parser(source: String) {
             val isOf = at(T.OF); eat()
             val right = expression(); eat(T.RPAREN)
             val body = statement()
-            val leftName = Ident(init.declarators[0].name).pos(tok)
+            val d0 = init.declarators[0]
+            // For pattern-bound `for (var [a,b] of …)` we synthesise a hidden temp
+            // identifier and wrap `body` in a destructuring assignment — handled
+            // later by the Compiler which recognises the Labeled tag.  For now we
+            // require a simple identifier; complex patterns trigger a TODO-style
+            // error that points at the correct source location.
+            val leftName = if (d0.name != null) Ident(d0.name).pos(tok)
+            else throw ParseError("destructuring in for-in/of not yet supported", tok.line, tok.col)
             return if (isOf) ForOf(init.kind, leftName, right, body).pos(tok)
                    else ForIn(init.kind, leftName, right, body).pos(tok)
         }
@@ -208,6 +335,10 @@ class Parser(source: String) {
         }
         eat()
         val right = assignment()
+        // Destructuring assignment: [a,b] = rhs  or  ({a,b} = rhs).
+        if (op == "=" && (left is ArrayLit || left is ObjectLit)) {
+            return DestructuringAssign(exprToPattern(left), right).pos(tok)
+        }
         return Assign(op, left, right).pos(tok)
     }
 
@@ -414,7 +545,13 @@ class Parser(source: String) {
         val items = mutableListOf<Expr?>()
         while (!at(T.RBRACK)) {
             if (at(T.COMMA)) { items.add(null); eat(T.COMMA); continue }
-            items.add(assignment())
+            if (at(T.ELLIPSIS)) {
+                val etok = eat()
+                val arg = assignment()
+                items.add(Unary("...", arg, true).pos(etok))
+            } else {
+                items.add(assignment())
+            }
             if (!at(T.RBRACK)) eat(T.COMMA)
         }
         eat(T.RBRACK)
@@ -425,6 +562,14 @@ class Parser(source: String) {
         eat(T.LBRACE)
         val props = mutableListOf<Pair<String, Expr>>()
         while (!at(T.RBRACE)) {
+            if (at(T.ELLIPSIS)) {
+                val etok = eat()
+                val arg = assignment()
+                // Mark rest/spread with a sentinel key; Compiler / exprToPattern handle it.
+                props.add("__rest__" to Unary("...", arg, true).pos(etok))
+                if (!at(T.RBRACE)) eat(T.COMMA)
+                continue
+            }
             val kTok = peek()
             val key = when (kTok.type) {
                 T.IDENT, T.STRING, T.NUMBER -> eat().value
@@ -433,6 +578,9 @@ class Parser(source: String) {
             // shorthand {x}
             if (at(T.COMMA) || at(T.RBRACE)) {
                 props.add(key to Ident(key).pos(kTok))
+            } else if (match(T.ASSIGN)) {
+                // {x = 1}: used only as pattern; we represent the "default" via Assign node
+                props.add(key to Assign("=", Ident(key).pos(kTok), assignment()).pos(kTok))
             } else {
                 eat(T.COLON)
                 props.add(key to assignment())
