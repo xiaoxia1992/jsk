@@ -155,17 +155,54 @@ class Compiler private constructor(
         }
     }
 
-    private fun compileFunction(name: String, params: List<String>, body: Block, isArrow: Boolean): Bytecode {
+    private fun compileFunction(name: String, params: List<Param>, body: Block, isArrow: Boolean): Bytecode {
         val bc = Bytecode(name = name, paramCount = params.size, isArrow = isArrow)
         bc.source = bytecode.source
         val c = Compiler(parent = this, bytecode = bc)
-        // params -> first N slots
-        for (p in params) c.declareLocal(p)
+        // Reserve slot 0..N-1 for parameters. For simple identifier params, the slot is
+        // pre-filled by the VM (`args[i]`). For pattern params, we reserve a slot anyway
+        // but overwrite it via the destructuring prelude below.
+        for (p in params) {
+            val slotName = p.name ?: "__param${c.nextSlot}__"
+            c.declareLocal(slotName)
+        }
         c.hoistVarAndFunctions(body.body, isTopLevel = false)
+
+        // --- parameter prelude: defaults and destructuring ---
+        for ((i, p) in params.withIndex()) {
+            when {
+                p.rest -> {
+                    // Emit:  __paramI__ = Array.prototype.slice.call(arguments, i)
+                    //        (simplified: use LOAD_ARGUMENTS then .slice(i))
+                    val slot = c.scope.locals[p.name!!]!!
+                    bc.emit(Op.LOAD_ARGUMENTS)
+                    bc.emit(Op.LOAD_PROP, bc.strIdx("slice"))
+                    bc.emit(Op.LOAD_ARGUMENTS)
+                    bc.emit(Op.SWAP)                    // stack: args, sliceFn
+                    bc.emit(Op.LOAD_INT, i)
+                    bc.emit(Op.CALL_METHOD, 1)
+                    bc.emit(Op.STORE_LOCAL, slot); bc.emit(Op.POP)
+                }
+                p.pattern != null -> {
+                    // Push the current param value, apply default, bind the pattern.
+                    bc.emit(Op.LOAD_ARG, i)
+                    if (p.default != null) c.applyDefault(p.default)
+                    c.compileBindPattern(p.pattern, kind = "let")
+                }
+                p.default != null -> {
+                    val slot = c.scope.locals[p.name!!]!!
+                    // if arg is undefined, initialize with default
+                    bc.emit(Op.LOAD_ARG, i)
+                    c.applyDefault(p.default)
+                    bc.emit(Op.STORE_LOCAL, slot); bc.emit(Op.POP)
+                }
+                // else: plain identifier param — VM already filled the slot
+            }
+        }
+
         for (s in body.body) c.compileStmt(s)
         bc.emit(Op.RET_UNDEF)
         bc.localCount = c.nextSlot
-        // Publish upvalue table as a strings/indices pair on bytecode via a sidecar
         bc.upvalueInfo = c.upvalues.toList()
         return bc
     }

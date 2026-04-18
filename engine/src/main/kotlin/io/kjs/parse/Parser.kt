@@ -296,11 +296,23 @@ class Parser(source: String) {
         return FunctionDecl(name, params, body).pos(tok)
     }
 
-    private fun paramList(): List<String> {
+    private fun paramList(): List<Param> {
         eat(T.LPAREN)
-        val ps = mutableListOf<String>()
+        val ps = mutableListOf<Param>()
         if (!at(T.RPAREN)) {
-            do { ps.add(eat(T.IDENT).value) } while (match(T.COMMA))
+            do {
+                val tok = peek()
+                if (match(T.ELLIPSIS)) {
+                    // ...name — rest parameter
+                    val nm = eat(T.IDENT).value
+                    ps.add(Param(nm, null, null, rest = true).pos(tok))
+                    break   // rest must be the last param
+                }
+                val pat = if (at(T.LBRACK) || at(T.LBRACE)) bindingPattern() else null
+                val name = if (pat == null) eat(T.IDENT).value else null
+                val def = if (match(T.ASSIGN)) assignment() else null
+                ps.add(Param(name, pat, def, rest = false).pos(tok))
+            } while (match(T.COMMA))
         }
         eat(T.RPAREN)
         return ps
@@ -494,7 +506,7 @@ class Parser(source: String) {
                     val p = eat().value
                     eat(T.ARROW)
                     val body: Node = if (at(T.LBRACE)) block() else assignment()
-                    return ArrowFn(listOf(p), body).pos(tok)
+                    return ArrowFn(listOf(Param.simple(p).pos(tok)), body).pos(tok)
                 }
                 eat(); Ident(tok.value).pos(tok)
             }
@@ -531,7 +543,7 @@ class Parser(source: String) {
         if (allIdents && at(T.RPAREN) && peek(1).type == T.ARROW) {
             eat(T.RPAREN); eat(T.ARROW)
             val body: Node = if (at(T.LBRACE)) block() else assignment()
-            return ArrowFn(names, body).pos(tok)
+            return ArrowFn(names.map { Param.simple(it).pos(tok) }, body).pos(tok)
         }
         // rollback to plain parenthesized expression
         pos = snapshot

@@ -31,9 +31,20 @@ class Break(val label: String?) : Stmt()
 class Continue(val label: String?) : Stmt()
 class Throw(val arg: Expr) : Stmt()
 class Try(val block: Block, val catchParam: String?, val catchBody: Block?, val finallyBody: Block?) : Stmt()
-class FunctionDecl(val name: String, val params: List<String>, val body: Block) : Stmt()
+class FunctionDecl(val name: String, val params: List<Param>, val body: Block) : Stmt()
 class EmptyStmt : Stmt()
 class Labeled(val label: String, val body: Stmt) : Stmt()
+
+/**
+ * A function parameter.  Exactly one of [name] and [pattern] is non-null.
+ * [default] is the default-value expression when the argument is undefined.
+ * [rest] marks the trailing `...name` parameter collecting remaining args.
+ */
+class Param(val name: String?, val pattern: Pattern?, val default: Expr?, val rest: Boolean = false) : Node() {
+    companion object {
+        fun simple(name: String): Param = Param(name, null, null, false)
+    }
+}
 
 // --- Destructuring patterns ---
 /**
@@ -64,8 +75,8 @@ object ThisExpr : Expr()
 class Ident(val name: String) : Expr()
 class ArrayLit(val elements: List<Expr?>) : Expr()
 class ObjectLit(val props: List<Pair<String, Expr>>) : Expr()
-class FunctionExpr(val name: String?, val params: List<String>, val body: Block) : Expr()
-class ArrowFn(val params: List<String>, val body: Node /* Expr or Block */) : Expr()
+class FunctionExpr(val name: String?, val params: List<Param>, val body: Block) : Expr()
+class ArrowFn(val params: List<Param>, val body: Node /* Expr or Block */) : Expr()
 class Unary(val op: String, val arg: Expr, val prefix: Boolean) : Expr()
 class Update(val op: String /* ++, -- */, val arg: Expr, val prefix: Boolean) : Expr()
 class Binary(val op: String, val left: Expr, val right: Expr) : Expr()

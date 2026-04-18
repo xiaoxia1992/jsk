@@ -27,8 +27,11 @@ class Interpreter(val realm: Realm) {
      *  - own `prototype` = fresh object (whose own `constructor` points back to the fn)
      *  - arrow fns skip the `prototype` slot and are marked with `__arrow__`.
      */
-    fun mkUserFunction(name: String, params: List<String>, body: Block, env: Environment, isArrow: Boolean): JsFunction {
-        val fn = JsFunction.user(name, params, body, env)
+    fun mkUserFunction(name: String, params: List<io.kjs.parse.Param>, body: Block, env: Environment, isArrow: Boolean): JsFunction {
+        // Walker backend supports simple identifier params only. Complex patterns /
+        // defaults are handled by the bytecode VM.
+        val flatNames = params.map { it.name ?: "__pat${params.indexOf(it)}" }
+        val fn = JsFunction.user(name, flatNames, body, env)
         fn.invoker = ::callUserFn
         fn.proto = realm.functionProto
         fn.set("name", name)
