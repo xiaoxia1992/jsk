@@ -16,6 +16,12 @@ object JitBridge {
 
     @JvmStatic fun toBool(v: Any?): Boolean = JsValues.toBool(v)
 
+    /** Unbox to primitive double. Used by JIT to pull a value into a D slot / D operation. */
+    @JvmStatic fun toD(v: Any?): Double = JsValues.toNumber(v)
+
+    /** Double → bool conversion with JS semantics (NaN and 0.0 → false). */
+    @JvmStatic fun dToBool(d: Double): Boolean = !(d.isNaN() || d == 0.0)
+
     @JvmStatic fun toNumberBoxed(v: Any?): Any? = JsValues.toNumber(v)
 
     @JvmStatic fun add(l: Any?, r: Any?): Any? =
