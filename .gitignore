@@ -1,0 +1,22 @@
+# Git ignore
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+# IntelliJ
+.idea/
+*.iws
+*.iml
+*.ipr
+out/
+
+# macOS
+.DS_Store
+
+# third_party (test262 etc)
+third_party/
+
+# logs
+*.log

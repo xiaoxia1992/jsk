@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# kjs — 便捷启动器
+#
+# 用法：
+#   ./kjs                      启动 REPL
+#   ./kjs foo.js               执行脚本
+#   ./kjs -e "console.log(1)"  执行代码片段
+#   KJS_BACKEND=walker ./kjs … 切到 tree-walker 后端做对拍
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+APP="$HERE/cli/build/install/cli/bin/cli"
+
+# 首次使用时自动构建分发包
+if [ ! -x "$APP" ]; then
+  (cd "$HERE" && ./gradlew :cli:installDist -q --console=plain)
+fi
+
+# 选择 JDK 17+（macOS Homebrew / JBR 两个常见位置）
+if [ -z "${JAVA_HOME:-}" ] || ! "$JAVA_HOME/bin/java" -version 2>&1 | grep -qE '"(1[7-9]|[2-9][0-9])'; then
+  for CAND in \
+    "$HOME/Library/Java/JavaVirtualMachines/jbr-17.0.14/Contents/Home" \
+    "/Library/Java/JavaVirtualMachines/jdk-17.jdk/Contents/Home" \
+    "/opt/homebrew/opt/openjdk@17" \
+    "$(/usr/libexec/java_home -v 17 2>/dev/null || true)"; do
+    if [ -n "$CAND" ] && [ -x "$CAND/bin/java" ]; then
+      export JAVA_HOME="$CAND"; break
+    fi
+  done
+fi
+
+exec "$APP" "$@"
