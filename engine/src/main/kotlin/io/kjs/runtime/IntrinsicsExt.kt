@@ -164,6 +164,52 @@ object IntrinsicsExt {
                 }
             }
         })
+        p.set("replaceAll", fn("replaceAll", 2) { s, a ->
+            val str = selfStr(s); val pat = arg(a, 0); val repl = arg(a, 1)
+            val replStr: (MatchResult) -> String = { m ->
+                when (repl) {
+                    is JsFunction -> {
+                        val args = mutableListOf<Any?>(m.value)
+                        args.addAll(m.groupValues.drop(1))
+                        args.add(m.range.first.toDouble()); args.add(str)
+                        JsValues.toStr(repl.call(JsValues.UNDEFINED, args))
+                    }
+                    else -> JsValues.toStr(repl)
+                }
+            }
+            when (pat) {
+                is JsObject -> if (pat.className == "RegExp") {
+                    val re = toRegex(pat); re.replace(str, replStr)
+                } else {
+                    val needle = JsValues.toStr(pat)
+                    if (needle.isEmpty()) str else {
+                        val sb = StringBuilder(); var p2 = 0
+                        while (true) {
+                            val idx = str.indexOf(needle, p2)
+                            if (idx < 0) { sb.append(str.substring(p2)); break }
+                            sb.append(str, p2, idx); sb.append(replStr(MatchFakeResult(needle, idx, str)))
+                            p2 = idx + needle.length
+                        }
+                        sb.toString()
+                    }
+                }
+                else -> {
+                    val needle = JsValues.toStr(pat)
+                    if (needle.isEmpty()) str else str.split(needle).joinToString(JsValues.toStr(repl))
+                }
+            }
+        })
+        p.set("matchAll", fn("matchAll", 1) { s, a ->
+            val str = selfStr(s); val pat = arg(a, 0)
+            val re = toRegex(pat)
+            val wrapped = re.findAll(str).map { m ->
+                val arr = JsArray().apply { this.proto = r.arrayProto }
+                arr.push(m.value); for (g in m.groupValues.drop(1)) arr.push(g)
+                arr.set("index", m.range.first.toDouble())
+                arr as Any?
+            }.iterator()
+            makeJsIterator(r, wrapped)
+        })
         // String.raw (template tag) — simplified
         val strCtor = r.globalEnv.get("String") as JsObject
         strCtor.set("raw", fn("raw", 1) { _, a ->
@@ -220,6 +266,19 @@ object IntrinsicsExt {
         p.set("findIndex", fn("findIndex", 1) { self, a ->
             val arr = asArr(self); val f = a.first() as JsFunction
             for (i in 0 until arr.length) if (JsValues.toBool(f.call(JsValues.UNDEFINED, listOf(arr.get(i.toString()), i.toDouble(), arr)))) return@fn i.toDouble()
+            (-1.0)
+        })
+        p.set("findLast", fn("findLast", 1) { self, a ->
+            val arr = asArr(self); val f = a.first() as JsFunction
+            for (i in arr.length - 1 downTo 0) {
+                val v = arr.get(i.toString())
+                if (JsValues.toBool(f.call(JsValues.UNDEFINED, listOf(v, i.toDouble(), arr)))) return@fn v
+            }
+            JsValues.UNDEFINED
+        })
+        p.set("findLastIndex", fn("findLastIndex", 1) { self, a ->
+            val arr = asArr(self); val f = a.first() as JsFunction
+            for (i in arr.length - 1 downTo 0) if (JsValues.toBool(f.call(JsValues.UNDEFINED, listOf(arr.get(i.toString()), i.toDouble(), arr)))) return@fn i.toDouble()
             (-1.0)
         })
         p.set("flat", fn("flat", 0) { self, a ->
@@ -373,6 +432,46 @@ object IntrinsicsExt {
         proto.set("toString", fn("toString", 0) { self, _ ->
             val t = JsValues.toNumber((self as? JsObject)?.get("_time") ?: Double.NaN)
             if (t.isNaN()) "Invalid Date" else java.util.Date(t.toLong()).toString()
+        })
+        // Date component accessors: use a UTC-free Calendar at the local TZ.
+        fun cal(self: Any?): java.util.Calendar {
+            val t = JsValues.toNumber((self as? JsObject)?.get("_time") ?: Double.NaN)
+            val c = java.util.Calendar.getInstance()
+            c.timeInMillis = t.toLong()
+            return c
+        }
+        proto.set("getFullYear", fn("getFullYear", 0) { self, _ -> cal(self).get(java.util.Calendar.YEAR).toDouble() })
+        proto.set("getMonth",    fn("getMonth", 0)    { self, _ -> cal(self).get(java.util.Calendar.MONTH).toDouble() })
+        proto.set("getDate",     fn("getDate", 0)     { self, _ -> cal(self).get(java.util.Calendar.DAY_OF_MONTH).toDouble() })
+        proto.set("getDay",      fn("getDay", 0)      { self, _ -> ((cal(self).get(java.util.Calendar.DAY_OF_WEEK) + 6) % 7).toDouble() })  // JS: 0 = Sun
+        proto.set("getHours",    fn("getHours", 0)    { self, _ -> cal(self).get(java.util.Calendar.HOUR_OF_DAY).toDouble() })
+        proto.set("getMinutes",  fn("getMinutes", 0)  { self, _ -> cal(self).get(java.util.Calendar.MINUTE).toDouble() })
+        proto.set("getSeconds",  fn("getSeconds", 0)  { self, _ -> cal(self).get(java.util.Calendar.SECOND).toDouble() })
+        proto.set("getMilliseconds", fn("getMilliseconds", 0) { self, _ -> cal(self).get(java.util.Calendar.MILLISECOND).toDouble() })
+        proto.set("getTimezoneOffset", fn("getTimezoneOffset", 0) { _, _ ->
+            (-java.util.TimeZone.getDefault().rawOffset / 60_000).toDouble()
+        })
+        proto.set("getUTCFullYear", fn("getUTCFullYear", 0) { self, _ ->
+            val c = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+            c.timeInMillis = JsValues.toNumber((self as JsObject).get("_time")).toLong()
+            c.get(java.util.Calendar.YEAR).toDouble()
+        })
+        proto.set("getUTCMonth", fn("getUTCMonth", 0) { self, _ ->
+            val c = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+            c.timeInMillis = JsValues.toNumber((self as JsObject).get("_time")).toLong()
+            c.get(java.util.Calendar.MONTH).toDouble()
+        })
+        proto.set("toLocaleString", fn("toLocaleString", 0) { self, _ ->
+            val t = JsValues.toNumber((self as JsObject).get("_time"))
+            if (t.isNaN()) "Invalid Date" else java.text.DateFormat.getDateTimeInstance().format(java.util.Date(t.toLong()))
+        })
+        proto.set("toLocaleDateString", fn("toLocaleDateString", 0) { self, _ ->
+            val t = JsValues.toNumber((self as JsObject).get("_time"))
+            if (t.isNaN()) "Invalid Date" else java.text.DateFormat.getDateInstance().format(java.util.Date(t.toLong()))
+        })
+        proto.set("toJSON", fn("toJSON", 0) { self, _ ->
+            val t = JsValues.toNumber((self as? JsObject)?.get("_time") ?: Double.NaN)
+            if (t.isNaN()) JsValues.NULL else java.time.Instant.ofEpochMilli(t.toLong()).toString()
         })
         r.globalObject.set("Date", ctor); r.globalEnv.declare("Date", ctor)
     }

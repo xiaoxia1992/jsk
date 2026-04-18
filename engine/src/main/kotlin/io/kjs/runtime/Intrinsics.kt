@@ -306,6 +306,9 @@ object Intrinsics {
         defineFn(ctor, "isNaN", 1) { _, a -> val v = arg(a, 0); v is Double && v.isNaN() }
         defineFn(ctor, "isFinite", 1) { _, a -> val v = arg(a, 0); v is Double && !v.isNaN() && !v.isInfinite() }
         defineFn(ctor, "isInteger", 1) { _, a -> val v = arg(a, 0); v is Double && !v.isNaN() && !v.isInfinite() && v == Math.floor(v) }
+        defineFn(ctor, "isSafeInteger", 1) { _, a ->
+            val v = arg(a, 0); v is Double && !v.isNaN() && !v.isInfinite() && v == Math.floor(v) && Math.abs(v) <= 9007199254740991.0
+        }
         defineFn(ctor, "parseFloat", 1) { _, a -> JsValues.toStr(arg(a, 0)).trim().toDoubleOrNull() ?: Double.NaN }
         defineFn(ctor, "parseInt", 2) { _, a ->
             val s = JsValues.toStr(arg(a, 0)).trim()
