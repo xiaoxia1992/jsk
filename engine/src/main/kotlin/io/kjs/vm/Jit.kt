@@ -113,6 +113,7 @@ object Jit {
         Op.LOAD_ZERO, Op.LOAD_ONE, Op.LOAD_INT, Op.LOAD_CONST, Op.LOAD_STR,
         Op.LOAD_LOCAL, Op.STORE_LOCAL, Op.LOAD_ARG,
         Op.LOAD_GLOBAL,     // via bridge
+        Op.LOAD_PROP,       // via bridge + PropIc (IC still in bc.caches)
         Op.POP, Op.DUP, Op.SWAP,
         Op.ADD, Op.SUB, Op.MUL, Op.DIV, Op.MOD,
         Op.NEG, Op.PLUS, Op.NOT, Op.TO_NUMBER, Op.TYPEOF,
@@ -213,6 +214,7 @@ object Jit {
                     Op.LOAD_LOCAL -> push(if (a in 0 until bc.localCount && vote[a].toInt() == 1) 1 else 0)
                     Op.LOAD_ARG -> push(0)
                     Op.LOAD_GLOBAL -> push(0)
+                    Op.LOAD_PROP -> { pop(); push(0) }      // consume obj, push result
 
                     Op.STORE_LOCAL -> {
                         if (a in 0 until bc.localCount) {
@@ -583,6 +585,30 @@ object Jit {
                     m.visitIntInsn(SIPUSH, bc.bOpsA[pc])  // tolerate (b operand)
                     m.visitMethodInsn(INVOKESTATIC, BRIDGE, "loadGlobal",
                         "(L$VM;L$CLOSURE;II)L$OBJECT;", false)
+                    apush(T.ANY)
+                }
+
+                Op.LOAD_PROP -> {
+                    // Top-of-stack holds 'obj'. Box it so we can pass Object to the bridge.
+                    boxTop()
+                    // Target signature: loadProp(Vm, VmClosure, int pc, Object obj, int nameIdx)
+                    // Currently JVM stack:  ..., obj(ANY)
+                    // We want:              ..., vm, closure, pc, obj, nameIdx
+                    // Stash obj by swapping with the static args via SWAP/DUP_X1 tricks. Easiest:
+                    // store obj in a temp local (scratch slot beyond user locals).
+                    //
+                    // Scratch slot = total KJS locals expanded. To avoid conflict we grab a slot
+                    // deterministically: we never use slot numbers > last local's end.
+                    val scratch = 6 + bc.localCount * 2   // conservative high slot
+                    m.visitVarInsn(ASTORE, scratch)
+                    apop()                                // obj no longer on stack
+                    m.visitVarInsn(ALOAD, 1)              // vm
+                    m.visitVarInsn(ALOAD, LV_CLOSURE)     // closure
+                    m.visitLdcInsn(pc)                    // pc
+                    m.visitVarInsn(ALOAD, scratch)        // obj
+                    m.visitIntInsn(SIPUSH, a)             // nameIdx
+                    m.visitMethodInsn(INVOKESTATIC, BRIDGE, "loadProp",
+                        "(L$VM;L$CLOSURE;IL$OBJECT;I)L$OBJECT;", false)
                     apush(T.ANY)
                 }
 

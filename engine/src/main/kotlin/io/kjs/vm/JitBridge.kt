@@ -86,6 +86,45 @@ object JitBridge {
     }
 
     /**
+     * LOAD_PROP fast path.  Walks the same code path the interpreter does:
+     * goes through the PropIc slot stored in `closure.bc.caches[pc]`, which
+     * remembers the monomorphic shape/owner — highly inline-friendly for
+     * HotSpot once the site is hot.
+     *
+     * For non-JsObject receivers we fall back to the generic prop lookup
+     * (`loadPropGeneric`), which handles Strings/Numbers/Booleans via their
+     * corresponding prototypes.
+     */
+    @JvmStatic fun loadProp(vm: Vm, closure: VmClosure, pc: Int, obj: Any?, nameIdx: Int): Any? {
+        val name = closure.bc.strings[nameIdx]
+        if (obj is io.kjs.runtime.JsObject) {
+            var caches = closure.bc.caches
+            if (caches == null) { caches = arrayOfNulls<Any?>(closure.bc.size); closure.bc.caches = caches }
+            var ic = caches[pc] as? PropIc
+            if (ic == null) { ic = PropIc(); caches[pc] = ic }
+            return ic.get(obj, name) { o, n -> if (o == null) Undefined else o.get(n) }
+        }
+        return loadPropGeneric(vm, obj, name)
+    }
+
+    @JvmStatic fun loadPropGeneric(vm: Vm, obj: Any?, name: String): Any? = when (obj) {
+        null -> jsThrowTypeError(vm.realm, "Cannot read property '$name' of null")
+        Undefined -> jsThrowTypeError(vm.realm, "Cannot read property '$name' of undefined")
+        is String -> stringPropFor(vm, obj, name)
+        is io.kjs.runtime.JsObject -> obj.get(name)
+        is Double, is Int, is Long -> vm.realm.numberProto.get(name)
+        is Boolean -> vm.realm.booleanProto.get(name)
+        else -> Undefined
+    }
+
+    private fun stringPropFor(vm: Vm, s: String, key: String): Any? {
+        val idx = key.toIntOrNull()
+        if (idx != null && idx in s.indices) return s[idx].toString()
+        if (key == "length") return s.length.toDouble()
+        return vm.realm.stringProto.get(key)
+    }
+
+    /**
      * Invoke a callable value as a plain function call. Used by the JIT for
      * `Op.CALL` (the global-`this` case). `args` has already been assembled
      * by the generated code.
