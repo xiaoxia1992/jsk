@@ -21,6 +21,31 @@ object IntrinsicsExt {
     private fun arg(args: List<Any?>, i: Int): Any? = if (i < args.size) args[i] else JsValues.UNDEFINED
     private fun fn(name: String, arity: Int, body: (Any?, List<Any?>) -> Any?) = JsFunction.native(name, arity, body)
 
+    /**
+     * Build an iterator result object `{value, done}`. Used by generator-like
+     * iterator implementations registered on Map/Set/Array prototypes.
+     */
+    internal fun iterResult(r: Realm, value: Any?, done: Boolean): JsObject {
+        val o = JsObject(r.objectProto)
+        o.set("value", value); o.set("done", done)
+        return o
+    }
+
+    /**
+     * Wrap a Kotlin Iterator into a JsObject implementing the ES iterator protocol
+     * (a `next()` method returning `{value, done}`).
+     */
+    internal fun makeJsIterator(r: Realm, it: Iterator<Any?>): JsObject {
+        val o = JsObject(r.objectProto); o.className = "Iterator"
+        o.set("next", JsFunction.native("next", 0) { _, _ ->
+            if (it.hasNext()) iterResult(r, it.next(), false)
+            else iterResult(r, JsValues.UNDEFINED, true)
+        })
+        // Self-reference so `for-of (iter)` works too.
+        o.set("@@iterator", JsFunction.native("@@iterator", 0) { self, _ -> self ?: JsValues.UNDEFINED })
+        return o
+    }
+
     // ---- Object extensions ----
     private fun extendObject(r: Realm) {
         val ctor = r.globalEnv.get("Object") as JsObject
@@ -405,6 +430,35 @@ object IntrinsicsExt {
             for ((k, v) in store(self)) f.call(JsValues.UNDEFINED, listOf(v, k, self))
             JsValues.UNDEFINED
         })
+        proto.set("keys", fn("keys", 0) { self, _ ->
+            makeJsIterator(r, store(self).keys.iterator() as Iterator<Any?>)
+        })
+        proto.set("values", fn("values", 0) { self, _ ->
+            makeJsIterator(r, store(self).values.iterator() as Iterator<Any?>)
+        })
+        proto.set("entries", fn("entries", 0) { self, _ ->
+            val src = store(self).entries.iterator()
+            val wrapped = object : Iterator<Any?> {
+                override fun hasNext() = src.hasNext()
+                override fun next(): Any? {
+                    val (k, v) = src.next()
+                    val arr = JsArray().apply { this.proto = r.arrayProto }; arr.push(k); arr.push(v); return arr
+                }
+            }
+            makeJsIterator(r, wrapped)
+        })
+        // Default iterator for Map is `entries()`.
+        proto.set("@@iterator", JsFunction.native("@@iterator", 0) { self, _ ->
+            val src = store(self).entries.iterator()
+            val wrapped = object : Iterator<Any?> {
+                override fun hasNext() = src.hasNext()
+                override fun next(): Any? {
+                    val (k, v) = src.next()
+                    val arr = JsArray().apply { this.proto = r.arrayProto }; arr.push(k); arr.push(v); return arr
+                }
+            }
+            makeJsIterator(r, wrapped)
+        })
         r.globalObject.set("Map", ctor); r.globalEnv.declare("Map", ctor)
     }
     private class MapHolder(val m: java.util.LinkedHashMap<Any?, Any?>)
@@ -430,6 +484,26 @@ object IntrinsicsExt {
             val f = a.first() as JsFunction
             for (v in store(self)) f.call(JsValues.UNDEFINED, listOf(v, v, self))
             JsValues.UNDEFINED
+        })
+        proto.set("keys", fn("keys", 0) { self, _ ->
+            makeJsIterator(r, store(self).iterator() as Iterator<Any?>)
+        })
+        proto.set("values", fn("values", 0) { self, _ ->
+            makeJsIterator(r, store(self).iterator() as Iterator<Any?>)
+        })
+        proto.set("entries", fn("entries", 0) { self, _ ->
+            val src = store(self).iterator()
+            val wrapped = object : Iterator<Any?> {
+                override fun hasNext() = src.hasNext()
+                override fun next(): Any? {
+                    val v = src.next()
+                    val arr = JsArray().apply { this.proto = r.arrayProto }; arr.push(v); arr.push(v); return arr
+                }
+            }
+            makeJsIterator(r, wrapped)
+        })
+        proto.set("@@iterator", JsFunction.native("@@iterator", 0) { self, _ ->
+            makeJsIterator(r, store(self).iterator() as Iterator<Any?>)
         })
         r.globalObject.set("Set", ctor); r.globalEnv.declare("Set", ctor)
     }

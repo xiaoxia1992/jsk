@@ -205,6 +205,17 @@ object Intrinsics {
         defineFn(r.arrayProto, "toString", 0) { self, _ ->
             val a = asArr(self); (0 until a.length).joinToString(",") { JsValues.toStr(a.get(it.toString())) }
         }
+        // Iterator protocol for arrays (so for-of works generically).
+        fun seqIter(src: (JsArray) -> Iterator<Any?>): JsFunction = JsFunction.native("iter", 0) { self, _ ->
+            val a = self as JsArray
+            IntrinsicsExt.makeJsIterator(r, src(a))
+        }
+        r.arrayProto.set("@@iterator", seqIter { a -> (0 until a.length).map { a.get(it.toString()) }.iterator() })
+        r.arrayProto.set("values",    seqIter { a -> (0 until a.length).map { a.get(it.toString()) }.iterator() })
+        r.arrayProto.set("keys",      seqIter { a -> (0 until a.length).map<Int, Any?> { it.toDouble() }.iterator() })
+        r.arrayProto.set("entries",   seqIter { a -> (0 until a.length).map<Int, Any?> { i ->
+            val pair = JsArray().apply { proto = r.arrayProto }; pair.push(i.toDouble()); pair.push(a.get(i.toString())); pair
+        }.iterator() })
 
         r.globalObject.set("Array", ctor)
         r.globalEnv.declare("Array", ctor)

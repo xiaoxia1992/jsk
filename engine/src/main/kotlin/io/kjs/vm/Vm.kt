@@ -505,18 +505,13 @@ class Vm(val realm: Realm) {
                     }
                     Op.FOR_OF_INIT -> {
                         val obj = f.pop()
-                        val items = when (obj) {
-                            is String -> obj.map { it.toString() as Any? }
-                            is JsArray -> (0 until obj.length).map { obj.get(it.toString()) }
-                            is JsObject -> obj.keys().map { obj.get(it) as Any? }
-                            else -> emptyList()
-                        }
-                        f.push(IterState(items, 0))
+                        val state = buildForOfState(obj)
+                        f.push(state)
                     }
                     Op.FOR_OF_NEXT -> {
-                        val it = f.peek() as IterState
-                        if (it.idx >= it.items.size) f.pc = a
-                        else { f.push(it.items[it.idx]); it.idx++ }
+                        val it = f.peek() as ForOfState
+                        if (!it.advance(this)) f.pc = a
+                        else f.push(it.currentValue)
                     }
 
                     Op.PUSH_BLOCK, Op.POP_BLOCK -> {}
@@ -548,6 +543,59 @@ class Vm(val realm: Realm) {
     }
 
     private class IterState(val items: List<Any?>, var idx: Int)
+
+    /**
+     * State object for a `for-of` loop that obeys the iterator protocol.
+     * [advance] invokes `iterator.next()` once; returns true iff we got a value.
+     */
+    internal class ForOfState(val iterator: JsObject, val nextFn: JsFunction) {
+        var currentValue: Any? = JsValues.UNDEFINED
+        fun advance(vm: Vm): Boolean {
+            val result = vm.invokeFast(nextFn, iterator, emptyArray())
+            val r = result as? JsObject ?: return false
+            val done = JsValues.toBool(r.get("done"))
+            if (done) return false
+            currentValue = r.get("value")
+            return true
+        }
+    }
+
+    /**
+     * Build a [ForOfState] for the given iterable using the ES iterator protocol.
+     * If the object doesn't expose `@@iterator`, we fall back to a best-effort
+     * synthetic iteration over indexed elements / keys (for compatibility).
+     */
+    private fun buildForOfState(obj: Any?): ForOfState {
+        // 1) Look for `@@iterator` on the object (or its proto chain).
+        if (obj is JsObject) {
+            val iterFn = obj.get("@@iterator")
+            if (iterFn is JsFunction) {
+                val iterator = iterFn.call(obj, emptyList())
+                if (iterator is JsObject) {
+                    val nextFn = iterator.get("next") as? JsFunction
+                        ?: error("iterator 'next' is not a function")
+                    return ForOfState(iterator, nextFn)
+                }
+            }
+        }
+        // 2) Fallback: wrap the legacy index-based iteration into a synthetic iterator.
+        val items: List<Any?> = when (obj) {
+            is String -> obj.map { it.toString() as Any? }
+            is JsArray -> (0 until obj.length).map { obj.get(it.toString()) }
+            is JsObject -> obj.keys().map { obj.get(it) as Any? }
+            else -> emptyList()
+        }
+        var idx = 0
+        val fakeIter = JsObject(realm.objectProto).apply { className = "Iterator" }
+        val fakeNext = JsFunction.native("next", 0) { _, _ ->
+            val o = JsObject(realm.objectProto)
+            if (idx < items.size) { o.set("value", items[idx]); o.set("done", false); idx++ }
+            else { o.set("value", JsValues.UNDEFINED); o.set("done", true) }
+            o
+        }
+        fakeIter.set("next", fakeNext)
+        return ForOfState(fakeIter, fakeNext)
+    }
 
     /** Short textual rendering of the current operand stack; used by the tracer. */
     private fun snapshot(f: Frame): String {

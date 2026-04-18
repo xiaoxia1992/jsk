@@ -13,6 +13,7 @@ class ParseError(msg: String, val line: Int, val col: Int) : RuntimeException("$
 class Parser(source: String) {
     private val tokens: List<Token> = Lexer(source).tokenize()
     private var pos = 0
+    private var pendingLoopId = 0
 
     fun parseProgram(): Program {
         val stmts = mutableListOf<Stmt>()
@@ -252,15 +253,25 @@ class Parser(source: String) {
             val right = expression(); eat(T.RPAREN)
             val body = statement()
             val d0 = init.declarators[0]
-            // For pattern-bound `for (var [a,b] of …)` we synthesise a hidden temp
-            // identifier and wrap `body` in a destructuring assignment — handled
-            // later by the Compiler which recognises the Labeled tag.  For now we
-            // require a simple identifier; complex patterns trigger a TODO-style
-            // error that points at the correct source location.
-            val leftName = if (d0.name != null) Ident(d0.name).pos(tok)
-            else throw ParseError("destructuring in for-in/of not yet supported", tok.line, tok.col)
-            return if (isOf) ForOf(init.kind, leftName, right, body).pos(tok)
-                   else ForIn(init.kind, leftName, right, body).pos(tok)
+            // for-of supports a pattern LHS by synthesising a hidden temp variable
+            // and prepending a destructuring declaration to the loop body.
+            if (d0.name != null) {
+                val leftName = Ident(d0.name).pos(tok)
+                return if (isOf) ForOf(init.kind, leftName, right, body).pos(tok)
+                       else ForIn(init.kind, leftName, right, body).pos(tok)
+            } else {
+                val pat = d0.pattern!!
+                val tempName = "__forOfTmp${pendingLoopId++}__"
+                val newDecl = VarDecl(init.kind, listOf(Declarator(tempName, null, null).pos(tok))).pos(tok)
+                val destructDecl = VarDecl(init.kind,
+                    listOf(Declarator(null, pat, Ident(tempName).pos(tok)).pos(tok))).pos(tok)
+                // New body = Block { destructDecl; original body }
+                val newBody = Block(listOf(destructDecl, body)).pos(tok)
+                val leftName = Ident(tempName).pos(tok)
+                // Use the synthesised single-ident varDecl shape for ForOf/ForIn's AST.
+                return if (isOf) ForOf(init.kind, leftName, right, newBody).pos(tok)
+                       else ForIn(init.kind, leftName, right, newBody).pos(tok)
+            }
         }
         if (init is ExprStmt && (at(T.IN) || at(T.OF))) {
             val isOf = at(T.OF); eat()
