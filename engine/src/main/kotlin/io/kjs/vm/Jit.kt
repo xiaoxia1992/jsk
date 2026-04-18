@@ -112,6 +112,7 @@ object Jit {
         Op.LOAD_UNDEF, Op.LOAD_NULL, Op.LOAD_TRUE, Op.LOAD_FALSE,
         Op.LOAD_ZERO, Op.LOAD_ONE, Op.LOAD_INT, Op.LOAD_CONST, Op.LOAD_STR,
         Op.LOAD_LOCAL, Op.STORE_LOCAL, Op.LOAD_ARG,
+        Op.LOAD_GLOBAL,     // via bridge
         Op.POP, Op.DUP, Op.SWAP,
         Op.ADD, Op.SUB, Op.MUL, Op.DIV, Op.MOD,
         Op.NEG, Op.PLUS, Op.NOT, Op.TO_NUMBER, Op.TYPEOF,
@@ -121,7 +122,11 @@ object Jit {
         Op.STASH_RESULT, Op.HALT,
         Op.GET_THIS,
         Op.PUSH_BLOCK, Op.POP_BLOCK,
+        Op.CALL,            // argc <= 4 (see emitter)
     )
+
+    /** Max argc we JIT-compile a CALL for; larger ones cause function rejection. */
+    private const val MAX_JIT_CALL_ARGC = 4
 
     fun canCompile(bc: Bytecode): Boolean {
         if (disabled) return false
@@ -129,6 +134,10 @@ object Jit {
             val op = OP_VALUES[bc.codeA[i]]
             if (op !in supported) {
                 log { "✗ ${bc.name} cannot be JIT'd — unsupported opcode $op at pc=$i" }
+                return false
+            }
+            if (op == Op.CALL && bc.aOpsA[i] > MAX_JIT_CALL_ARGC) {
+                log { "✗ ${bc.name} cannot be JIT'd — CALL with argc=${bc.aOpsA[i]} > $MAX_JIT_CALL_ARGC at pc=$i" }
                 return false
             }
         }
@@ -203,6 +212,7 @@ object Jit {
 
                     Op.LOAD_LOCAL -> push(if (a in 0 until bc.localCount && vote[a].toInt() == 1) 1 else 0)
                     Op.LOAD_ARG -> push(0)
+                    Op.LOAD_GLOBAL -> push(0)
 
                     Op.STORE_LOCAL -> {
                         if (a in 0 until bc.localCount) {
@@ -232,6 +242,12 @@ object Jit {
                     Op.TYPEOF -> { pop(); push(0) }
 
                     Op.LT, Op.LE, Op.GT, Op.GE, Op.EQ, Op.NEQ, Op.SEQ, Op.SNEQ -> { pop(); pop(); push(2) }
+
+                    Op.CALL -> {
+                        val argc = a
+                        for (i in 0 until argc + 1) pop()   // pop argN-1..arg0, callee
+                        push(0)                             // result is ANY
+                    }
 
                     Op.JMP -> reset()
                     Op.JT, Op.JF -> { pop() }
@@ -559,6 +575,17 @@ object Jit {
                     apush(T.ANY)
                 }
 
+                Op.LOAD_GLOBAL -> {
+                    // JitBridge.loadGlobal(vm, closure, nameIdx, tolerate) -> Any?
+                    m.visitVarInsn(ALOAD, 1)              // vm
+                    m.visitVarInsn(ALOAD, LV_CLOSURE)     // closure
+                    m.visitIntInsn(SIPUSH, a)             // nameIdx
+                    m.visitIntInsn(SIPUSH, bc.bOpsA[pc])  // tolerate (b operand)
+                    m.visitMethodInsn(INVOKESTATIC, BRIDGE, "loadGlobal",
+                        "(L$VM;L$CLOSURE;II)L$OBJECT;", false)
+                    apush(T.ANY)
+                }
+
                 Op.POP -> {
                     when (atop()) { T.DOUBLE -> m.visitInsn(POP2); else -> m.visitInsn(POP) }
                     apop()
@@ -681,6 +708,76 @@ object Jit {
                 }
 
                 Op.GET_THIS -> { m.visitVarInsn(ALOAD, LV_THIS); apush(T.ANY) }
+
+                Op.CALL -> {
+                    val argc = a
+                    // Stack (top→bottom): argN-1, ..., arg0, callee.
+                    // We need every one of these argc+1 entries to be ANY so
+                    // we can pass them to a plain Java-signature bridge.
+                    // We box top-down, flipping via SWAP when the second entry
+                    // needs boxing. Because we only handle argc <= 4, the
+                    // combinatorial cases stay manageable.
+
+                    // Step 1: box the argc values (top, then swap down).
+                    // Easier: call boxAllStack-like routine but limited to the
+                    // top argc+1 entries. If a DOUBLE is deeper than top two we
+                    // abort — this keeps codegen simple and correct.
+                    val needed = argc + 1
+                    if (aStack.size < needed) throw JitAbort("CALL: stack shorter than argc+1")
+                    // Check: any DOUBLE deeper than position 1 → abort.
+                    for (i in 0 until needed) {
+                        val depthFromTop = i        // 0 = top, 1 = 2nd, ...
+                        val idx = aStack.size - 1 - depthFromTop
+                        if (aStack.elementAt(idx) == T.DOUBLE && depthFromTop >= 2)
+                            throw JitAbort("CALL: DOUBLE buried too deep for boxing")
+                    }
+                    // Box the top first.
+                    if (atop() != T.ANY) boxTop()
+                    // Now box the second from top if needed.
+                    if (needed >= 2 && aStack.elementAt(aStack.size - 2) != T.ANY) {
+                        val second = aStack.elementAt(aStack.size - 2)
+                        if (second == T.DOUBLE) throw JitAbort("CALL: cat2 second operand")
+                        // BOOL second under ANY top → SWAP, box, SWAP.
+                        m.visitInsn(SWAP)
+                        val t1 = aStack.removeLast(); val t2 = aStack.removeLast(); aStack.addLast(t1); aStack.addLast(t2)
+                        boxTop()
+                        m.visitInsn(SWAP)
+                        val s1 = aStack.removeLast(); val s2 = aStack.removeLast(); aStack.addLast(s1); aStack.addLast(s2)
+                    }
+                    // After boxing, all top-(argc+1) entries are ANY on JVM stack.
+                    // Build argsOfN via static helper: push callee aside by swapping out.
+
+                    // Strategy for building args + keeping callee accessible:
+                    //   Current:  ..., callee, arg0, ..., argN-1            (N = argc)
+                    //   Use INVOKESTATIC JitBridge.argsOfN(Object... ) to bundle
+                    //   the top N into an Object[], leaving 'callee' on top:
+                    //   After:    ..., callee, args:Object[]
+                    //   Then swap those two and push 'vm':
+                    //   Target:   ..., vm, callee, args
+                    //   Call JitBridge.invokeCall(vm, callee, args).
+                    val argSig = buildString {
+                        append("(")
+                        repeat(argc) { append("L$OBJECT;") }
+                        append(")[L$OBJECT;")
+                    }
+                    m.visitMethodInsn(INVOKESTATIC, BRIDGE, "argsOf$argc", argSig, false)
+                    // Stack: ..., callee, args[]
+                    m.visitInsn(SWAP)
+                    // Stack: ..., args[], callee
+                    // Load VM reference under them — but JVM can't "insert beneath",
+                    // so we'll restructure: push VM, DUP_X2 to move it below, then POP top duplicate?
+                    // Simpler: call a 2-arg invokeCall(callee, args) that fetches VM from a ThreadLocal?
+                    // To avoid ThreadLocal overhead, extend the signature:
+                    //   invokeCall2(args:Object[], callee:Object, vm:Vm) — parameters in the
+                    // exact order they appear on JVM stack.
+                    m.visitVarInsn(ALOAD, 1)   // LV_VM
+                    // Stack: ..., args[], callee, vm
+                    m.visitMethodInsn(INVOKESTATIC, BRIDGE, "invokeCall2",
+                        "([L$OBJECT;L$OBJECT;L$VM;)L$OBJECT;", false)
+                    // Pop argc+1 (callee + args) from abstract stack, push return (ANY).
+                    repeat(needed) { aStack.removeLast() }
+                    aStack.addLast(T.ANY)
+                }
 
                 else -> error("JIT: unsupported opcode $op — canCompile() should have rejected")
             }

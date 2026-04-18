@@ -196,7 +196,7 @@ class Vm(val realm: Realm) {
     }
 
     /** Fast path for VM closures: avoid the lambda indirection + List.toList allocation. */
-    private fun invokeFast(fn: JsFunction, thisVal: Any?, argsArr: Array<Any?>): Any? {
+    internal fun invokeFast(fn: JsFunction, thisVal: Any?, argsArr: Array<Any?>): Any? {
         val vc = fn.vmClosure as? VmClosure
         if (vc != null) return execClosureArr(vc, thisVal, argsArr)
         // Fallback to generic path (native functions, bound functions, etc.).

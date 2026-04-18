@@ -69,4 +69,44 @@ object JitBridge {
     /** Read a pooled constant from the closure's compiled bytecode. */
     @JvmStatic fun constOf(c: VmClosure, idx: Int): Any? = c.bc.constants[idx]
     @JvmStatic fun strOf(c: VmClosure, idx: Int): Any? = c.bc.strings[idx]
+
+    /**
+     * Load a global/lexically-visible binding by name. Mirrors the interpreter's
+     * `Op.LOAD_GLOBAL` semantics: throws ReferenceError if missing and not
+     * tolerated, otherwise returns the value (possibly Undefined).
+     */
+    @JvmStatic fun loadGlobal(vm: Vm, closure: VmClosure, nameIdx: Int, tolerate: Int): Any? {
+        val name = closure.bc.strings[nameIdx]
+        val e = closure.closureEnv ?: vm.realm.globalEnv
+        if (!e.has(name)) {
+            if (tolerate != 0) return Undefined
+            jsThrowName(vm.realm, "ReferenceError", "$name is not defined")
+        }
+        return e.get(name)
+    }
+
+    /**
+     * Invoke a callable value as a plain function call. Used by the JIT for
+     * `Op.CALL` (the global-`this` case). `args` has already been assembled
+     * by the generated code.
+     */
+    @JvmStatic fun invokeCall(vm: Vm, callee: Any?, args: Array<Any?>): Any? {
+        val fn = callee as? io.kjs.runtime.JsFunction
+            ?: jsThrowTypeError(vm.realm, "value is not a function")
+        return vm.invokeFast(fn, vm.realm.globalObject, args)
+    }
+
+    /**
+     * Stack-order variant: parameters laid out as the JIT wants them on the
+     * JVM stack (args, callee, vm). Equivalent to [invokeCall].
+     */
+    @JvmStatic fun invokeCall2(args: Array<Any?>, callee: Any?, vm: Vm): Any? =
+        invokeCall(vm, callee, args)
+
+    /** Convenience: build an Object[] of size n from the top N items of an already-collected list. */
+    @JvmStatic fun argsOf0(): Array<Any?> = emptyArray()
+    @JvmStatic fun argsOf1(a0: Any?): Array<Any?> = arrayOf(a0)
+    @JvmStatic fun argsOf2(a0: Any?, a1: Any?): Array<Any?> = arrayOf(a0, a1)
+    @JvmStatic fun argsOf3(a0: Any?, a1: Any?, a2: Any?): Array<Any?> = arrayOf(a0, a1, a2)
+    @JvmStatic fun argsOf4(a0: Any?, a1: Any?, a2: Any?, a3: Any?): Array<Any?> = arrayOf(a0, a1, a2, a3)
 }
