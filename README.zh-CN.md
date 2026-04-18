@@ -16,6 +16,7 @@
 - **60+ opcode 栈式字节码** — 指令存在三条并行的 `IntArray`（opcode / 操作数 A / 操作数 B）中，对 CPU cache 友好。
 - **真闭包** — 被捕获的 local 会就地替换成共享的 `Upvalue` box，多个闭包和父函数看到的永远是同一份值。
 - **单态属性内联缓存**（`PropIc`）— 命中时直接按 slot 读取；重复未命中后降级为 megamorphic。
+- **模板 JIT** — 热函数会在运行时通过 ASM 被编译成 JVM 字节码，再由 HotSpot C2 进一步编译到机器码，算术热循环实测 **12–40× 加速**。
 - **`--trace` 教学模式** — 打印 token 流、AST、字节码反汇编、以及 VM 每一步执行后的栈状态，便于学习。
 - **可嵌入** — 宿主（Kotlin）代码可以注入自己的命名空间和 native 函数，内置 `kjs.rand / kjs.ms / kjs.assert / kjs.repeat` 就是示例。
 - **Test262 兼容运行器** — 解析 YAML frontmatter、加载 `harness/` includes、支持 `negative` / `features` 指令。
@@ -98,22 +99,45 @@ git clone https://github.com/tc39/test262 third_party/test262
 
 ## 性能
 
-测试环境：Apple Silicon MacBook + JDK 17。每段脚本 2 次预热 + 5 次计时，表中是 5 次的累计墙钟时间（毫秒）。
+测试环境：Apple Silicon MacBook + JDK 17。每段脚本预热后跑 5 次计时，下表是 5 次累计墙钟时间（毫秒）。
 
-| 基准 | Tree-walker | KJS VM | 加速比 |
-|---|---:|---:|---:|
-| `fib(28)` × 5 | ~800 ms | ~430 ms | **1.9×** |
-| 紧循环 100 万次 | ~720 ms | ~460 ms | **1.6×** |
-| 属性密集热循环 | ~260 ms | ~200 ms | **1.3×** |
-| 字符串拼接 1 万次 | ~95 ms | ~70 ms | **1.4×** |
+**纯算术热循环（JIT 触发）：**
 
-KJS 目前仍是解释器，现代 JIT 引擎（例如 V8）还是要再快 **30–100 倍**。拉近这个差距就是下面 roadmap 的主要目标。
+| 基准 | 解释器 | **KJS JIT** | V8 (Node v24) | JIT 加速 |
+|---|---:|---:|---:|---:|
+| 累加 100 万次 | ~420 ms | **~35 ms** | ~3 ms | **12×** |
+| 多项式 100 万次 | ~870 ms | **~22 ms** | ~6 ms | **40×** |
+| 数 5000 内素数 | ~39 ms | **~7 ms** | ~0 ms | **5.5×** |
+| 紧循环 100 万次 | ~480 ms | **~41 ms** | — | **12×** |
+
+**混合场景（JIT 回落到解释器）：**
+
+| 基准 | 解释器 | KJS VM |
+|---|---:|---:|
+| `fib(28)` × 5 | ~800 ms | ~430 ms |
+| 属性密集热循环 | ~260 ms | ~200 ms |
+| 字符串拼接 1 万次 | ~95 ms | ~70 ms |
+
+### JIT 原理
+
+函数被调用几次以后，KJS 会通过 ASM 把它的字节码翻译成 **JVM 字节码**——生成一个 `Compiled` 子类，其 `invoke` 方法直接运行在 JVM 原生操作数栈上。接着 HotSpot C2 会把这个类进一步编译成机器码，相当于**两级 JIT 接力**：KJS → JVM → native。
+
+当前 JIT 策略保守——只 JIT 由算术、比较、局部变量、控制流组成的函数。一旦碰到函数调用、属性访问、闭包构造、异常处理，就回落解释器。这是为了稳妥推进；后续把这条线继续外推见 roadmap。
+
+### JIT 开关
+
+```bash
+./kjs foo.js                        # 默认开启（阈值 3）
+KJS_JIT=off ./kjs foo.js            # 关闭 JIT
+KJS_JIT_THRESHOLD=10 ./kjs foo.js   # 调用 10 次后才编译
+KJS_JIT_VERBOSE=1 ./kjs foo.js      # 打印 JIT 决策到 stderr
+```
 
 ## 尚未实现 / 后续规划
 
 - **NaN-boxing** — 把所有 JS 值塞进 64-bit `Long`，消除 JVM 装箱开销
 - **Shape / 隐藏类 + 多态 IC** — 当前 IC 只做单态匹配（按 className）
-- **模板 JIT** — 把热字节码序列用 ASM 编译成 `MethodHandle` 链
+- **JIT 覆盖扩大** — 支持含 CALL、属性访问、闭包的函数；加入 OSR 让正在跑的长循环也能被 JIT
 - **ES 语言缺口** — 解构、`class`、rest/spread、generator、`async/await`、ES 模块
 
 ## 许可

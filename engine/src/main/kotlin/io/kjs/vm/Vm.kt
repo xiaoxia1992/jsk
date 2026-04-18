@@ -15,7 +15,14 @@ class VmClosure(
     val bc: Bytecode,
     val closureEnv: Environment?,   // nullable for top-level
     val upvalues: Array<Upvalue>,
-)
+) {
+    /** Invocation counter used to decide when to JIT-compile. */
+    @JvmField var hotness: Int = 0
+    /** Non-null once JIT'd; then execution bypasses the opcode dispatch loop. */
+    @JvmField var compiled: Compiled? = null
+    /** Sticks at `true` if canCompile() refused; prevents repeated attempts. */
+    @JvmField var jitRejected: Boolean = false
+}
 
 /**
  * Stack-based bytecode VM. One [Frame] per active call.
@@ -118,6 +125,30 @@ class Vm(val realm: Realm) {
     }
 
     private fun execClosureArr(c: VmClosure, thisVal: Any?, argsArr: Array<Any?>): Any? {
+        // JIT fast path: if already compiled, invoke the generated class directly.
+        val already = c.compiled
+        if (already != null) return already.invoke(this, realm, c, thisVal, argsArr)
+
+        // Hotness tracking + on-demand JIT compile.
+        if (!c.jitRejected && c.compiled == null) {
+            c.hotness++
+            if (Jit.shouldCompile(c.hotness)) {
+                if (Jit.canCompile(c.bc)) {
+                    try {
+                        c.compiled = Jit.compile(c.bc)
+                        return c.compiled!!.invoke(this, realm, c, thisVal, argsArr)
+                    } catch (e: Throwable) {
+                        // JIT failure should never be user-visible; degrade to interpreter.
+                        Jit.log { "compile failed for ${c.bc.name}: ${e.message}" }
+                        c.jitRejected = true
+                    }
+                } else {
+                    Jit.log { "rejected ${c.bc.name}: unsupported opcode(s)" }
+                    c.jitRejected = true
+                }
+            }
+        }
+
         val bc = c.bc
         val localsSize = maxOf(bc.localCount, bc.paramCount) + 4
         val stack = borrowStack()

@@ -16,6 +16,7 @@ It runs a pragmatic subset of **ES5 + ES2015+**, ships with a narrated "teaching
 - **60+ opcode stack machine** — instructions are stored in three parallel `IntArray` lanes (opcode / operand A / operand B) for cache-friendly dispatch.
 - **Real closures** — captured locals are promoted to shared `Upvalue` boxes so multiple closures and the parent frame all see the latest value.
 - **Monomorphic inline caches** for property access, with a megamorphic fallback after repeated misses.
+- **Template JIT** — hot functions are compiled to JVM bytecode at runtime via ASM, reaching **12–40× speedups** on arithmetic workloads (HotSpot's C2 then JITs the generated class to native code).
 - **Narrated `--trace` mode** — prints the token stream, AST, bytecode disassembly, and per-instruction stack state; designed for learners.
 - **Embeddable** — host code can expose its own namespaces and native functions (see the built-in `kjs.rand / kjs.ms / kjs.assert / kjs.repeat` example).
 - **Test262-compatible runner** — parses YAML frontmatter, loads `harness/` includes, honours `negative`/`features` directives.
@@ -98,22 +99,52 @@ git clone https://github.com/tc39/test262 third_party/test262
 
 ## Performance
 
-Measured on an Apple-silicon MacBook with JDK 17. All scripts run five times after two warmup iterations; times are the wall-clock sum in milliseconds.
+Measured on an Apple-silicon MacBook with JDK 17. Each benchmark runs five times after warmup; numbers are wall-clock totals in milliseconds.
 
-| Benchmark | Tree-walker | KJS VM | Speedup |
-|---|---:|---:|---:|
-| `fib(28)` × 5 | ~800 ms | ~430 ms | **1.9×** |
-| Tight loop (1 M iters) | ~720 ms | ~460 ms | **1.6×** |
-| Property-heavy hot loop | ~260 ms | ~200 ms | **1.3×** |
-| String build (10 K concat) | ~95 ms | ~70 ms | **1.4×** |
+**Pure-arithmetic hot loops (JIT kicks in):**
 
-KJS is still an interpreter — a modern JIT engine like V8 remains roughly **30–100× faster**. Closing that gap is what the remaining roadmap items target (see below).
+| Benchmark | Interpreter | **KJS JIT** | V8 (Node v24) | JIT speedup |
+|---|---:|---:|---:|---:|
+| Sum 1M integers | ~420 ms | **~35 ms** | ~3 ms | **12×** |
+| Polynomial 1M | ~870 ms | **~22 ms** | ~6 ms | **40×** |
+| Count primes ≤5000 | ~39 ms | **~7 ms** | ~0 ms | **5.5×** |
+| Tight loop 1M | ~480 ms | **~41 ms** | — | **12×** |
+
+**Mixed workloads (JIT bails out due to calls / property access):**
+
+| Benchmark | Interpreter | KJS VM |
+|---|---:|---:|
+| `fib(28)` × 5 | ~800 ms | ~430 ms |
+| Property-heavy hot loop | ~260 ms | ~200 ms |
+| String build (10 K concat) | ~95 ms | ~70 ms |
+
+### How the JIT works
+
+When a function gets called a few times, KJS compiles its bytecode to JVM
+bytecode via ASM, producing a `Compiled` subclass whose `invoke` method runs
+on the native JVM operand stack. HotSpot's C2 then compiles *that* to machine
+code, so you get a two-stage JIT for free: KJS → JVM → native.
+
+The JIT is deliberately conservative — it only touches functions composed of
+arithmetic, comparisons, locals, and control flow. The moment a function needs
+a call, property access, closure allocation, or exception handling, it stays on
+the interpreter. This trades coverage for safety; future work will push the
+line further (see roadmap).
+
+### JIT controls
+
+```bash
+./kjs foo.js                        # JIT enabled by default (threshold = 3)
+KJS_JIT=off ./kjs foo.js            # disable JIT (pure interpreter)
+KJS_JIT_THRESHOLD=10 ./kjs foo.js   # only compile after 10 calls
+KJS_JIT_VERBOSE=1 ./kjs foo.js      # trace JIT decisions to stderr
+```
 
 ## Not Yet Implemented (Roadmap)
 
 - **NaN-boxing** — pack all JS values into a 64-bit `Long` to eliminate autoboxing
 - **Shape / hidden-class polymorphic ICs** — today's IC is monomorphic on class name only
-- **Template JIT** — compile hot bytecode sequences to `MethodHandle` chains via ASM
+- **Broader JIT coverage** — compile functions containing calls, property access, and closures; add on-stack replacement (OSR) so long-running loops can be JIT'd mid-flight
 - **ES language gaps** — destructuring, `class`, rest/spread, generators, `async/await`, ES modules
 
 ## License
