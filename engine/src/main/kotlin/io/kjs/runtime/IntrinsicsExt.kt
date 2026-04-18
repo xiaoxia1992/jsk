@@ -16,6 +16,8 @@ object IntrinsicsExt {
         installMap(realm)
         installSet(realm)
         installPromise(realm)
+        installProxy(realm)
+        installReflect(realm)
     }
 
     private fun arg(args: List<Any?>, i: Int): Any? = if (i < args.size) args[i] else JsValues.UNDEFINED
@@ -679,5 +681,63 @@ object IntrinsicsExt {
         p.set("_state", state); p.set("_value", value)
         val cbs = (if (state == "fulfilled") p.get("_onFulfilled") else p.get("_onRejected")) as? JsArray ?: return
         for (i in 0 until cbs.length) (cbs.get(i.toString()) as? JsFunction)?.call(JsValues.UNDEFINED, listOf(value))
+    }
+
+    // ---- Proxy ----
+    private fun installProxy(r: Realm) {
+        val ctor = JsFunction.native("Proxy", 2) { _, a ->
+            val target = arg(a, 0) as? JsObject ?: throw JsThrown("TypeError: Proxy target must be an object")
+            val handler = arg(a, 1) as? JsObject ?: throw JsThrown("TypeError: Proxy handler must be an object")
+            JsProxy(target, handler)
+        }
+        r.globalObject.set("Proxy", ctor); r.globalEnv.declare("Proxy", ctor)
+    }
+
+    // ---- Reflect ----
+    private fun installReflect(r: Realm) {
+        val o = JsObject(r.objectProto)
+        o.set("get", fn("get", 2) { _, a ->
+            val t = arg(a, 0) as? JsObject ?: return@fn JsValues.UNDEFINED
+            t.get(JsValues.toStr(arg(a, 1)))
+        })
+        o.set("set", fn("set", 3) { _, a ->
+            val t = arg(a, 0) as? JsObject ?: return@fn false
+            t.set(JsValues.toStr(arg(a, 1)), arg(a, 2)); true
+        })
+        o.set("has", fn("has", 2) { _, a ->
+            val t = arg(a, 0) as? JsObject ?: return@fn false
+            t.has(JsValues.toStr(arg(a, 1)))
+        })
+        o.set("deleteProperty", fn("deleteProperty", 2) { _, a ->
+            val t = arg(a, 0) as? JsObject ?: return@fn false
+            t.delete(JsValues.toStr(arg(a, 1)))
+        })
+        o.set("ownKeys", fn("ownKeys", 1) { _, a ->
+            val t = arg(a, 0) as? JsObject ?: return@fn JsValues.UNDEFINED
+            val arr = JsArray().apply { this.proto = r.arrayProto }
+            for (k in t.keys()) arr.push(k); arr
+        })
+        o.set("getPrototypeOf", fn("getPrototypeOf", 1) { _, a -> (arg(a, 0) as? JsObject)?.proto ?: JsValues.NULL })
+        o.set("setPrototypeOf", fn("setPrototypeOf", 2) { _, a ->
+            val t = arg(a, 0) as? JsObject ?: return@fn false
+            t.proto = arg(a, 1) as? JsObject; true
+        })
+        o.set("apply", fn("apply", 3) { _, a ->
+            val f = arg(a, 0) as? JsFunction ?: throw JsThrown("TypeError: Reflect.apply called on non-function")
+            val thisVal = arg(a, 1)
+            val argsArr = arg(a, 2) as? JsArray
+            val args = if (argsArr == null) emptyList() else (0 until argsArr.length).map { argsArr.get(it.toString()) }
+            f.call(thisVal, args)
+        })
+        o.set("construct", fn("construct", 2) { _, a ->
+            val f = arg(a, 0) as? JsFunction ?: throw JsThrown("TypeError: Reflect.construct called on non-constructor")
+            val argsArr = arg(a, 1) as? JsArray
+            val args = if (argsArr == null) emptyList() else (0 until argsArr.length).map { argsArr.get(it.toString()) }
+            val proto = f.get("prototype") as? JsObject ?: r.objectProto
+            val inst = JsObject(proto)
+            val rv = f.call(inst, args)
+            if (rv is JsObject) rv else inst
+        })
+        r.globalObject.set("Reflect", o); r.globalEnv.declare("Reflect", o)
     }
 }

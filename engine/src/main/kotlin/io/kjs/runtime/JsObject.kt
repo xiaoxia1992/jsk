@@ -58,6 +58,53 @@ open class JsObject(
     open fun keys(): List<String> = properties.keys.toList()
 }
 
+/**
+ * ES2015 Proxy object.  Intercepts get / set / has / deleteProperty / ownKeys
+ * via a handler object; any other operation defers to the underlying target.
+ *
+ * This is intentionally a subset of the full spec — enough for common patterns
+ * like logging, defaulting, and virtualization.
+ */
+class JsProxy(val target: JsObject, val handler: JsObject) : JsObject(target.proto) {
+    init {
+        className = target.className
+        extensible = target.extensible
+    }
+
+    private fun trap(name: String): JsFunction? = handler.get(name) as? JsFunction
+
+    override fun get(key: String): Any? {
+        val t = trap("get") ?: return target.get(key)
+        return t.call(handler, listOf(target, key, this))
+    }
+
+    override fun getOwn(key: String): Any? = target.getOwn(key)
+
+    override fun hasOwn(key: String): Boolean = target.hasOwn(key)
+
+    override fun has(key: String): Boolean {
+        val t = trap("has") ?: return target.has(key)
+        return JsValues.toBool(t.call(handler, listOf(target, key)))
+    }
+
+    override fun set(key: String, value: Any?) {
+        val t = trap("set") ?: run { target.set(key, value); return }
+        t.call(handler, listOf(target, key, value, this))
+    }
+
+    override fun delete(key: String): Boolean {
+        val t = trap("deleteProperty") ?: return target.delete(key)
+        return JsValues.toBool(t.call(handler, listOf(target, key)))
+    }
+
+    override fun keys(): List<String> {
+        val t = trap("ownKeys") ?: return target.keys()
+        val r = t.call(handler, listOf(target))
+        if (r is JsArray) return (0 until r.length).map { JsValues.toStr(r.get(it.toString())) }
+        return target.keys()
+    }
+}
+
 class JsArray : JsObject() {
     init { className = "Array" }
     var length: Int
