@@ -22,6 +22,8 @@ class VmClosure(
     @JvmField var compiled: Compiled? = null
     /** Sticks at `true` if canCompile() refused; prevents repeated attempts. */
     @JvmField var jitRejected: Boolean = false
+    /** How many times we've called the JIT-compiled code so far (for telemetry). */
+    @JvmField var jitCalls: Int = 0
 }
 
 /**
@@ -127,23 +129,45 @@ class Vm(val realm: Realm) {
     private fun execClosureArr(c: VmClosure, thisVal: Any?, argsArr: Array<Any?>): Any? {
         // JIT fast path: if already compiled, invoke the generated class directly.
         val already = c.compiled
-        if (already != null) return already.invoke(this, realm, c, thisVal, argsArr)
+        if (already != null) {
+            c.jitCalls++
+            when {
+                Jit.logLevel >= 2 -> Jit.trace { "→ ${c.bc.name}() [JIT, #${c.jitCalls} call on compiled code]" }
+                Jit.logLevel >= 1 && c.jitCalls == 1 ->
+                    Jit.log { "✓ ${c.bc.name} now running on JIT-compiled code (first call)" }
+                Jit.logLevel >= 1 && c.jitCalls > 0 && c.jitCalls % 10000 == 0 ->
+                    Jit.log { "· ${c.bc.name} reached ${c.jitCalls} JIT calls" }
+            }
+            return already.invoke(this, realm, c, thisVal, argsArr)
+        }
 
-        // Hotness tracking + on-demand JIT compile.
+        // Interpreter path — maybe triggering compilation.
         if (!c.jitRejected && c.compiled == null) {
             c.hotness++
+            if (Jit.logLevel >= 2) {
+                val remaining = Jit.threshold - c.hotness
+                val tag = when {
+                    c.hotness < Jit.threshold -> "→ ${c.bc.name}() [interp, hotness ${c.hotness}/${Jit.threshold}, $remaining more to trigger JIT]"
+                    c.hotness == Jit.threshold -> "→ ${c.bc.name}() [interp, hotness ${c.hotness}/${Jit.threshold} — compiling now!]"
+                    else                       -> "→ ${c.bc.name}() [interp, hotness ${c.hotness}, no JIT]"
+                }
+                Jit.trace { tag }
+            }
             if (Jit.shouldCompile(c.hotness)) {
                 if (Jit.canCompile(c.bc)) {
                     try {
+                        val t0 = System.nanoTime()
                         c.compiled = Jit.compile(c.bc)
+                        val us = (System.nanoTime() - t0) / 1000
+                        Jit.log { "✓ compiled ${c.bc.name} → JVM bytecode in ${us}µs (${c.bc.size} KJS opcodes)" }
+                        c.jitCalls = 1
                         return c.compiled!!.invoke(this, realm, c, thisVal, argsArr)
                     } catch (e: Throwable) {
                         // JIT failure should never be user-visible; degrade to interpreter.
-                        Jit.log { "compile failed for ${c.bc.name}: ${e.message}" }
+                        Jit.log { "✗ compile failed for ${c.bc.name}: ${e.message} — falling back to interpreter" }
                         c.jitRejected = true
                     }
                 } else {
-                    Jit.log { "rejected ${c.bc.name}: unsupported opcode(s)" }
                     c.jitRejected = true
                 }
             }

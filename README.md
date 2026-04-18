@@ -137,7 +137,8 @@ line further (see roadmap).
 ./kjs foo.js                        # JIT enabled by default (threshold = 3)
 KJS_JIT=off ./kjs foo.js            # disable JIT (pure interpreter)
 KJS_JIT_THRESHOLD=10 ./kjs foo.js   # only compile after 10 calls
-KJS_JIT_VERBOSE=1 ./kjs foo.js      # trace JIT decisions to stderr
+KJS_JIT_LOG=1 ./kjs foo.js          # milestones: compile / skip / first-call
+KJS_JIT_LOG=trace ./kjs foo.js      # per-call countdown + JIT call counts
 ```
 
 ## Not Yet Implemented (Roadmap)

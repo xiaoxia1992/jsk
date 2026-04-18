@@ -130,7 +130,8 @@ git clone https://github.com/tc39/test262 third_party/test262
 ./kjs foo.js                        # 默认开启（阈值 3）
 KJS_JIT=off ./kjs foo.js            # 关闭 JIT
 KJS_JIT_THRESHOLD=10 ./kjs foo.js   # 调用 10 次后才编译
-KJS_JIT_VERBOSE=1 ./kjs foo.js      # 打印 JIT 决策到 stderr
+KJS_JIT_LOG=1 ./kjs foo.js          # 里程碑日志：编译、拒绝、首次调用、每 10000 次
+KJS_JIT_LOG=trace ./kjs foo.js      # 详细日志：每次调用的倒计时与 JIT 计数
 ```
 
 ## 尚未实现 / 后续规划

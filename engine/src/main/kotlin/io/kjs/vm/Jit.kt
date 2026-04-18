@@ -37,14 +37,34 @@ import org.objectweb.asm.Type
  *  - Nested functions are JITed independently on their own hotness.
  */
 object Jit {
-    private val threshold: Int = System.getenv("KJS_JIT_THRESHOLD")?.toIntOrNull() ?: 3
+    /**
+     * Hotness threshold: after this many invocations, eligible functions are
+     * compiled to JVM bytecode. Tune with KJS_JIT_THRESHOLD (default 3).
+     */
+    val threshold: Int = System.getenv("KJS_JIT_THRESHOLD")?.toIntOrNull() ?: 3
+
     private val disabled: Boolean = System.getenv("KJS_JIT")?.lowercase() in setOf("0", "off", "false", "no")
     private val verbose: Boolean = System.getenv("KJS_JIT_VERBOSE")?.isNotEmpty() == true
+
+    /** Logging level for user-visible JIT events. Env: `KJS_JIT_LOG`.
+     *   unset / 0  →  silent (default)
+     *   1          →  print milestones: compile / skip / first-JIT-call
+     *   trace      →  print every function invocation + countdown */
+    val logLevel: Int = when (System.getenv("KJS_JIT_LOG")?.lowercase()) {
+        null, "", "0", "off", "false" -> 0
+        "trace", "2" -> 2
+        else -> 1
+    }
 
     /** Called by Vm once a function crosses the hotness threshold. */
     fun shouldCompile(hotness: Int): Boolean = !disabled && hotness == threshold
 
-    internal fun log(msg: () -> String) { if (verbose) System.err.println("[jit] ${msg()}") }
+    internal fun log(msg: () -> String) {
+        if (verbose || logLevel >= 1) System.err.println("[jit] ${msg()}")
+    }
+    internal fun trace(msg: () -> String) {
+        if (logLevel >= 2) System.err.println("[jit] ${msg()}")
+    }
 
     // ---------- supported opcode predicate ----------
     // Conservative whitelist: arithmetic, comparisons, locals, unconditional +
@@ -74,7 +94,7 @@ object Jit {
         for (i in 0 until bc.size) {
             val op = OP_VALUES[bc.codeA[i]]
             if (op !in supported) {
-                log { "${bc.name}: unsupported opcode $op at pc=$i" }
+                log { "✗ ${bc.name} cannot be JIT'd — unsupported opcode $op at pc=$i" }
                 return false
             }
         }
