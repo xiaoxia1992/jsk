@@ -18,10 +18,13 @@ class VmClosure(
 ) {
     /** Invocation counter used to decide when to JIT-compile. */
     @JvmField var hotness: Int = 0
-    /** Non-null once JIT'd; then execution bypasses the opcode dispatch loop. */
-    @JvmField var compiled: Compiled? = null
+    /** Non-null once JIT'd; then execution bypasses the opcode dispatch loop.
+     *  Volatile because the background compiler thread publishes this field. */
+    @JvmField @Volatile var compiled: Compiled? = null
     /** Sticks at `true` if canCompile() refused; prevents repeated attempts. */
-    @JvmField var jitRejected: Boolean = false
+    @JvmField @Volatile var jitRejected: Boolean = false
+    /** True between "compilation requested" and "result published or failed". */
+    @JvmField @Volatile var compilePending: Boolean = false
     /** How many times we've called the JIT-compiled code so far (for telemetry). */
     @JvmField var jitCalls: Int = 0
 }
@@ -148,27 +151,22 @@ class Vm(val realm: Realm) {
                 val remaining = Jit.threshold - c.hotness
                 val tag = when {
                     c.hotness < Jit.threshold -> "→ ${c.bc.name}() [interp, hotness ${c.hotness}/${Jit.threshold}, $remaining more to trigger JIT]"
-                    c.hotness == Jit.threshold -> "→ ${c.bc.name}() [interp, hotness ${c.hotness}/${Jit.threshold} — compiling now!]"
-                    else                       -> "→ ${c.bc.name}() [interp, hotness ${c.hotness}, no JIT]"
+                    c.hotness == Jit.threshold -> "→ ${c.bc.name}() [interp, hotness ${c.hotness}/${Jit.threshold} — scheduling compile]"
+                    else                       -> "→ ${c.bc.name}() [interp, hotness ${c.hotness}, compile in flight]"
                 }
                 Jit.trace { tag }
             }
             if (Jit.shouldCompile(c.hotness)) {
-                if (Jit.canCompile(c.bc)) {
-                    try {
-                        val t0 = System.nanoTime()
-                        c.compiled = Jit.compile(c.bc)
-                        val us = (System.nanoTime() - t0) / 1000
-                        Jit.log { "✓ compiled ${c.bc.name} → JVM bytecode in ${us}µs (${c.bc.size} KJS opcodes)" }
-                        c.jitCalls = 1
-                        return c.compiled!!.invoke(this, realm, c, thisVal, argsArr)
-                    } catch (e: Throwable) {
-                        // JIT failure should never be user-visible; degrade to interpreter.
-                        Jit.log { "✗ compile failed for ${c.bc.name}: ${e.message} — falling back to interpreter" }
-                        c.jitRejected = true
-                    }
-                } else {
-                    c.jitRejected = true
+                // Schedule compilation on the background thread (or synchronous
+                // if KJS_JIT_ASYNC=off). This call never blocks the hot path.
+                Jit.requestCompile(c)
+                // If async-disabled (synchronous), `c.compiled` may already be
+                // non-null here; take the fast path below. Otherwise fall
+                // through to the interpreter for this invocation.
+                val justPublished = c.compiled
+                if (justPublished != null) {
+                    c.jitCalls = 1
+                    return justPublished.invoke(this, realm, c, thisVal, argsArr)
                 }
             }
         }

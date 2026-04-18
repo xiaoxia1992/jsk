@@ -56,6 +56,50 @@ object Jit {
 
     fun shouldCompile(hotness: Int): Boolean = !disabled && hotness == threshold
 
+    // ---------------- async compile dispatcher ----------------
+
+    /** Env switch: KJS_JIT_ASYNC=off forces the (old) synchronous compile path. */
+    private val asyncDisabled: Boolean = System.getenv("KJS_JIT_ASYNC")?.lowercase() in setOf("0", "off", "false", "no")
+
+    /** Single daemon thread: compilations are cheap and strictly ordered avoids surprises. */
+    private val compilerPool: java.util.concurrent.ExecutorService by lazy {
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "kjs-jit-compiler").apply { isDaemon = true }
+        }
+    }
+
+    /**
+     * Request a background compile of [closure]'s bytecode. When the compile
+     * finishes, the resulting [Compiled] is published to `closure.compiled`.
+     * If compilation fails or is rejected, `closure.jitRejected` is set.
+     * In both cases `closure.compilePending` goes back to false.
+     *
+     * If async mode is disabled (KJS_JIT_ASYNC=off), compiles inline instead.
+     */
+    fun requestCompile(closure: VmClosure) {
+        if (closure.compilePending || closure.compiled != null || closure.jitRejected) return
+        if (!canCompile(closure.bc)) { closure.jitRejected = true; return }
+
+        closure.compilePending = true
+
+        val task = Runnable {
+            try {
+                val t0 = System.nanoTime()
+                val compiled = compile(closure.bc)
+                val us = (System.nanoTime() - t0) / 1000
+                closure.compiled = compiled         // publish (volatile write)
+                log { "✓ compiled ${closure.bc.name} → JVM bytecode in ${us}µs (${closure.bc.size} KJS opcodes) [async]" }
+            } catch (t: Throwable) {
+                closure.jitRejected = true
+                log { "✗ compile failed for ${closure.bc.name}: ${t.message} — falling back to interpreter" }
+            } finally {
+                closure.compilePending = false
+            }
+        }
+
+        if (asyncDisabled) task.run() else compilerPool.execute(task)
+    }
+
     internal fun log(msg: () -> String) {
         if (verbose || logLevel >= 1) System.err.println("[jit] ${msg()}")
     }
