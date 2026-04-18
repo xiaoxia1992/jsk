@@ -130,17 +130,43 @@ git clone https://github.com/tc39/test262 third_party/test262
 ./kjs foo.js                        # 默认开启（阈值 3）
 KJS_JIT=off ./kjs foo.js            # 关闭 JIT
 KJS_JIT_SPEC=off ./kjs foo.js       # 关闭类型特化（仅用装箱版 JIT）
+KJS_JIT_ASYNC=off ./kjs foo.js      # 强制同步编译（默认走后台线程）
 KJS_JIT_THRESHOLD=10 ./kjs foo.js   # 调用 10 次后才编译
 KJS_JIT_LOG=1 ./kjs foo.js          # 里程碑日志：编译、拒绝、首次调用、每 10000 次
 KJS_JIT_LOG=trace ./kjs foo.js      # 详细日志：每次调用的倒计时与 JIT 计数
 ```
 
-JIT 在生成字节码前会先跑一次 **类型特化（type specialization）**：
-可证明全程为数值的局部变量会被分配到 JVM 的原生 `double` 槽
-（DSTORE/DLOAD），相邻两个 DOUBLE 操作数直接喂给 JVM 原生的
-`DADD/DMUL/DCMPL`，装箱完全消失。`sumN(1M)` 和 `poly(1M)` 跑到
-**10–15 ms**，比解释器快 20–60×、比装箱版 JIT 再快 2–3×。无法证明为
-纯数值的函数会自动回退到装箱路径，正确性不受影响。
+### JIT 做了什么
+
+1. **异步编译。** 函数达到 hotness 阈值时，字节码会被送到后台守护线程
+   `kjs-jit-compiler`，热路径完全不阻塞在 ASM 生成或 `defineClass` 上。
+2. **类型特化。** 编译前跑一遍抽象解释，判定哪些局部变量全程是数值；
+   这些变量直接分配到 JVM 的原生 `double` 槽（`DSTORE/DLOAD`），相邻
+   DOUBLE 操作数由 JVM 原生的 `DADD/DSUB/DMUL/DDIV/DREM` 与
+   `DCMPL/DCMPG + IF_*` 指令处理。
+3. **广覆盖字节码。** 算术、比较、局部/全局变量、属性读、条件/无条件
+   跳转、返回、函数调用（argc ≤ 4）全部可被 JIT；不能被编译的场景自动
+   回落到解释器。
+4. **常量池内联。** 每个生成的 Compiled 子类都持有自己的 `CONSTS` /
+   `STRINGS` static 字段，LOAD_CONST / LOAD_STR 变成一条 GETSTATIC +
+   AALOAD，HotSpot 很容易折叠。
+5. **Inline Cache。** LOAD_PROP 通过字节码级别的 `PropIc`，单态属性
+   读命中 IC 快路径，与解释器共享缓存。
+
+### 实测加速
+
+在 Apple M 系列单核、热 JVM 上测得（每项 5 次总时长）：
+
+| 基准                | 解释器    | JIT       | 提升     |
+| ------------------- | --------- | --------- | -------- |
+| `sumN(1M)`          | 403 ms    | **10 ms** | **40×**  |
+| `poly(1M)`          | 861 ms    | **12 ms** | **72×**  |
+| `countPrimes(5k)`   | 40 ms     | **8 ms**  | **5×**   |
+| `fib(32)`           | 607 ms    | **215 ms**| **2.8×** |
+| `sumField(1M)`      | 122 ms    | **116 ms**| **1.05×**（IC 本就很快）|
+
+热数值循环（`sumN` / `poly` / `square` …）几乎不再装箱：HotSpot C2
+会把这些值保持在 XMM 寄存器里，和手写 Java 的优化力度一致。
 
 ## 尚未实现 / 后续规划
 
