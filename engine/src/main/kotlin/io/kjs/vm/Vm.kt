@@ -354,38 +354,62 @@ class Vm(val realm: Realm) {
                         val r = f.pop(); val l = f.pop()
                         f.push(
                             if (l is Double && r is Double) l + r
+                            else if (l is java.math.BigInteger && r is java.math.BigInteger) l.add(r)
                             else if (l is String || r is String) JsValues.toStr(l) + JsValues.toStr(r)
                             else JsValues.toNumber(l) + JsValues.toNumber(r)
                         )
                     }
                     Op.SUB -> {
                         val r = f.pop(); val l = f.pop()
-                        f.push(if (l is Double && r is Double) l - r else JsValues.toNumber(l) - JsValues.toNumber(r))
+                        f.push(
+                            if (l is Double && r is Double) l - r
+                            else if (l is java.math.BigInteger && r is java.math.BigInteger) l.subtract(r)
+                            else JsValues.toNumber(l) - JsValues.toNumber(r)
+                        )
                     }
                     Op.MUL -> {
                         val r = f.pop(); val l = f.pop()
-                        f.push(if (l is Double && r is Double) l * r else JsValues.toNumber(l) * JsValues.toNumber(r))
+                        f.push(
+                            if (l is Double && r is Double) l * r
+                            else if (l is java.math.BigInteger && r is java.math.BigInteger) l.multiply(r)
+                            else JsValues.toNumber(l) * JsValues.toNumber(r)
+                        )
                     }
                     Op.DIV -> {
                         val r = f.pop(); val l = f.pop()
-                        f.push(if (l is Double && r is Double) l / r else JsValues.toNumber(l) / JsValues.toNumber(r))
+                        f.push(
+                            if (l is Double && r is Double) l / r
+                            else if (l is java.math.BigInteger && r is java.math.BigInteger) l.divide(r)
+                            else JsValues.toNumber(l) / JsValues.toNumber(r)
+                        )
                     }
                     Op.MOD -> {
                         val r = f.pop(); val l = f.pop()
-                        f.push(if (l is Double && r is Double) l % r else JsValues.toNumber(l) % JsValues.toNumber(r))
+                        f.push(
+                            if (l is Double && r is Double) l % r
+                            else if (l is java.math.BigInteger && r is java.math.BigInteger) l.mod(r.abs())
+                            else JsValues.toNumber(l) % JsValues.toNumber(r)
+                        )
                     }
                     Op.POW -> {
                         val r = f.pop(); val l = f.pop()
-                        f.push(Math.pow(JsValues.toNumber(l), JsValues.toNumber(r)))
+                        f.push(
+                            if (l is java.math.BigInteger && r is java.math.BigInteger) l.pow(r.toInt())
+                            else Math.pow(JsValues.toNumber(l), JsValues.toNumber(r))
+                        )
                     }
                     Op.LT -> {
                         val r = f.pop(); val l = f.pop()
                         f.push(
                             if (l is Double && r is Double) l < r
+                            else if (l is java.math.BigInteger && r is java.math.BigInteger) l < r
                             else numericCompare(l, r) { x, y -> x < y }
                         )
                     }
-                    Op.NEG -> f.push(-JsValues.toNumber(f.pop()))
+                    Op.NEG -> {
+                        val v = f.pop()
+                        f.push(if (v is java.math.BigInteger) v.negate() else -JsValues.toNumber(v))
+                    }
                     Op.PLUS -> f.push(JsValues.toNumber(f.pop()))
                     Op.NOT -> f.push(!JsValues.toBool(f.pop()))
                     Op.BITNOT -> f.push(JsValues.toInt32(f.pop()).inv().toDouble())
@@ -579,6 +603,7 @@ class Vm(val realm: Realm) {
 
     private inline fun numericCompare(a: Any?, b: Any?, cmp: (Double, Double) -> Boolean): Boolean {
         if (a is String && b is String) return cmp(a.compareTo(b).toDouble(), 0.0)
+        if (a is java.math.BigInteger && b is java.math.BigInteger) return cmp(a.compareTo(b).toDouble(), 0.0)
         val na = JsValues.toNumber(a); val nb = JsValues.toNumber(b)
         if (na.isNaN() || nb.isNaN()) return false
         return cmp(na, nb)

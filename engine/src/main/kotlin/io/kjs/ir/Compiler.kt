@@ -835,6 +835,7 @@ class Compiler private constructor(
     private fun compileExpr(e: Expr) {
         when (e) {
             is NumberLit -> emitNumber(e.value, e.line)
+            is BigIntLit -> bytecode.emit(Op.LOAD_CONST, bytecode.constIdx(e.value), 0, e.line)
             is StringLit -> bytecode.emit(Op.LOAD_STR, bytecode.strIdx(e.value), 0, e.line)
             is TemplateLit -> bytecode.emit(Op.LOAD_STR, bytecode.strIdx(e.raw), 0, e.line)
             is BoolLit -> bytecode.emit(if (e.value) Op.LOAD_TRUE else Op.LOAD_FALSE)

@@ -488,5 +488,24 @@ object Intrinsics {
             try { java.lang.Long.parseLong(s, radix).toDouble() } catch (_: Throwable) { Double.NaN }
         })
         r.globalEnv.declare("parseFloat", JsFunction.native("parseFloat", 1) { _, a -> JsValues.toStr(arg(a, 0)).trim().toDoubleOrNull() ?: Double.NaN })
+
+        // BigInt(v) — coerce to BigInteger.  Accepts strings, numbers (must be integer), booleans, BigInteger.
+        val bigIntCtor = JsFunction.native("BigInt", 1) { _, a ->
+            when (val v = arg(a, 0)) {
+                is java.math.BigInteger -> v
+                is Boolean -> if (v) java.math.BigInteger.ONE else java.math.BigInteger.ZERO
+                is Double -> {
+                    if (v.isNaN() || v.isInfinite() || v != Math.floor(v))
+                        throw JsThrown("RangeError: The number ${JsValues.toStr(v)} cannot be converted to BigInt")
+                    java.math.BigInteger.valueOf(v.toLong())
+                }
+                is Int -> java.math.BigInteger.valueOf(v.toLong())
+                is Long -> java.math.BigInteger.valueOf(v)
+                is String -> try { java.math.BigInteger(v.trim()) }
+                             catch (_: Throwable) { throw JsThrown("SyntaxError: Cannot convert '$v' to BigInt") }
+                else -> throw JsThrown("TypeError: Cannot convert to BigInt")
+            }
+        }
+        r.globalObject.set("BigInt", bigIntCtor); r.globalEnv.declare("BigInt", bigIntCtor)
     }
 }

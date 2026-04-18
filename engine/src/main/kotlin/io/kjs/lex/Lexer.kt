@@ -2,7 +2,7 @@ package io.kjs.lex
 
 enum class TokenType {
     // Literals
-    NUMBER, STRING, TEMPLATE_STRING, REGEX, IDENT,
+    NUMBER, BIGINT, STRING, TEMPLATE_STRING, REGEX, IDENT,
     TRUE, FALSE, NULL, UNDEFINED,
 
     // Keywords
@@ -36,6 +36,7 @@ data class Token(
     val line: Int,
     val col: Int,
     val numberValue: Double = 0.0,
+    val bigIntValue: java.math.BigInteger? = null,
 )
 
 class LexError(msg: String, val line: Int, val col: Int) : RuntimeException("$msg @ $line:$col")
@@ -133,7 +134,12 @@ class Lexer(private val source: String) {
         // hex
         if (peek() == '0' && (peek(1) == 'x' || peek(1) == 'X')) {
             sb.append(advance()); sb.append(advance())
-            while (peek().isLetterOrDigit()) sb.append(advance())
+            while (peek().let { (it in '0'..'9') || (it in 'a'..'f') || (it in 'A'..'F') }) sb.append(advance())
+            if (peek() == 'n') {
+                advance()
+                val bi = java.math.BigInteger(sb.substring(2), 16)
+                return setPrev(Token(TokenType.BIGINT, sb.toString() + "n", l, cc, 0.0, bi))
+            }
             val v = java.lang.Long.parseLong(sb.substring(2), 16).toDouble()
             return setPrev(Token(TokenType.NUMBER, sb.toString(), l, cc, v))
         }
@@ -148,6 +154,12 @@ class Lexer(private val source: String) {
             sb.append(advance())
             if (peek() == '+' || peek() == '-') sb.append(advance())
             while (peek().isDigit()) sb.append(advance())
+        }
+        // BigInt suffix: only for integer literals (no '.' or 'e' allowed)
+        if (peek() == 'n' && sb.none { it == '.' || it == 'e' || it == 'E' }) {
+            advance()
+            val bi = java.math.BigInteger(sb.toString())
+            return setPrev(Token(TokenType.BIGINT, sb.toString() + "n", l, cc, 0.0, bi))
         }
         val v = sb.toString().toDouble()
         return setPrev(Token(TokenType.NUMBER, sb.toString(), l, cc, v))

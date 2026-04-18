@@ -559,6 +559,7 @@ class Parser(source: String) {
         val tok = peek()
         return when (tok.type) {
             T.NUMBER -> { eat(); NumberLit(tok.numberValue).pos(tok) }
+            T.BIGINT -> { eat(); BigIntLit(tok.bigIntValue!!).pos(tok) }
             T.STRING -> { eat(); StringLit(tok.value).pos(tok) }
             T.TEMPLATE_STRING -> { eat(); expandTemplate(tok.value, tok) }
             T.REGEX -> {

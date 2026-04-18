@@ -232,6 +232,7 @@ class Interpreter(val realm: Realm) {
         is NewExpr -> evalNew(e, env)
         is Sequence -> { var last: Any? = JsValues.UNDEFINED; for (it in e.items) last = evalExpr(it, env); last }
         is TemplateLit -> e.raw
+        is BigIntLit -> e.value
         is DestructuringAssign -> throw JsThrown("destructuring assignment only supported on the bytecode VM")
         is ClassExpr -> throw JsThrown("class expressions only supported on the bytecode VM")
         is SuperMember -> throw JsThrown("'super' only supported on the bytecode VM")

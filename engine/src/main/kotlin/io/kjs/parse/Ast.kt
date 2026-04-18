@@ -98,6 +98,7 @@ class AssignTargetPattern(val target: Expr, val default: Expr? = null) : Pattern
 // --- Expressions ---
 sealed class Expr : Node()
 class NumberLit(val value: Double) : Expr()
+class BigIntLit(val value: java.math.BigInteger) : Expr()
 class StringLit(val value: String) : Expr()
 class BoolLit(val value: Boolean) : Expr()
 object NullLit : Expr()

@@ -17,6 +17,7 @@ object JsValues {
         null -> "object"
         is Boolean -> "boolean"
         is Double, is Int, is Long -> "number"
+        is java.math.BigInteger -> "bigint"
         is String -> "string"
         is JsFunction -> "function"
         is JsObject -> when {
@@ -33,6 +34,7 @@ object JsValues {
         is Double -> !(v.isNaN() || v == 0.0)
         is Int -> v != 0
         is Long -> v != 0L
+        is java.math.BigInteger -> v.signum() != 0
         is String -> v.isNotEmpty()
         else -> true
     }
@@ -44,6 +46,7 @@ object JsValues {
         is Double -> v
         is Int -> v.toDouble()
         is Long -> v.toDouble()
+        is java.math.BigInteger -> v.toDouble()
         is String -> {
             val s = v.trim()
             if (s.isEmpty()) 0.0
@@ -72,6 +75,7 @@ object JsValues {
         is Double -> numberToString(v)
         is Int -> v.toString()
         is Long -> v.toString()
+        is java.math.BigInteger -> v.toString()   // note: spec would *not* add "n" suffix for toString
         is JsObject -> toStr(v.defaultValue("string"))
         else -> v.toString()
     }
