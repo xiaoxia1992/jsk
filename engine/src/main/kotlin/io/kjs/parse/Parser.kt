@@ -74,6 +74,7 @@ class Parser(source: String) {
             T.THROW -> { eat(); val e = expression(); match(T.SEMI); Throw(e).pos(tok) }
             T.TRY -> tryStmt()
             T.FUNCTION -> funcDecl()
+            T.CLASS -> classDecl()
             T.SEMI -> { eat(); EmptyStmt().pos(tok) }
             else -> { val e = expression(); match(T.SEMI); ExprStmt(e).pos(tok) }
         }
@@ -296,6 +297,73 @@ class Parser(source: String) {
         return FunctionDecl(name, params, body).pos(tok)
     }
 
+    // ---- class declaration ----
+    private fun classDecl(): Stmt {
+        val tok = eat(T.CLASS)
+        val name = if (at(T.IDENT)) eat().value else null
+        val decl = classBody(name, tok)
+        return decl
+    }
+
+    private fun classBody(name: String?, tok: Token): ClassDecl {
+        var superClass: Expr? = null
+        if (match(T.EXTENDS)) {
+            superClass = leftHandSide()
+        }
+        eat(T.LBRACE)
+        val members = mutableListOf<ClassMember>()
+        var ctor: ClassMember? = null
+        while (!at(T.RBRACE) && !at(T.EOF)) {
+            if (match(T.SEMI)) continue
+            val mtok = peek()
+            // static prefix
+            var isStatic = false
+            if (peek().type == T.IDENT && peek().value == "static" && peek(1).type != T.LPAREN && peek(1).type != T.ASSIGN) {
+                eat()
+                isStatic = true
+            }
+            // getter / setter
+            var kind = MemberKind.METHOD
+            if (peek().type == T.IDENT && (peek().value == "get" || peek().value == "set")
+                && peek(1).type != T.LPAREN && peek(1).type != T.ASSIGN && peek(1).type != T.SEMI
+                && peek(1).type != T.RBRACE) {
+                kind = if (peek().value == "get") MemberKind.GETTER else MemberKind.SETTER
+                eat()
+            }
+            // private?
+            val isPrivate = peek().type == T.IDENT && peek().value.startsWith("#") // lexer doesn't emit # — we use a hack
+            // Actual private-field support (`#field`) requires lexer changes; skip for now.
+            // Name
+            val nameTok = peek()
+            val memberName = when (nameTok.type) {
+                T.IDENT, T.STRING, T.NUMBER -> eat().value
+                else -> eat(T.IDENT).value
+            }
+            if (memberName == "constructor" && !isStatic) {
+                // constructor(…) { body }
+                val params = paramList()
+                val body = block()
+                val fn = FunctionExpr(null, params, body).pos(mtok) as FunctionExpr
+                ctor = ClassMember("constructor", MemberKind.METHOD, false, false, fn, null).pos(mtok)
+                continue
+            }
+            // field declaration: name = init ; or name ;
+            if (at(T.ASSIGN) || at(T.SEMI) || at(T.RBRACE)) {
+                val init = if (match(T.ASSIGN)) assignment() else null
+                match(T.SEMI)
+                members.add(ClassMember(memberName, MemberKind.FIELD, isStatic, isPrivate, null, init).pos(mtok))
+                continue
+            }
+            // method
+            val params = paramList()
+            val body = block()
+            val fn = FunctionExpr(null, params, body).pos(mtok) as FunctionExpr
+            members.add(ClassMember(memberName, kind, isStatic, isPrivate, fn, null).pos(mtok))
+        }
+        eat(T.RBRACE)
+        return ClassDecl(name, superClass, ctor, members).pos(tok)
+    }
+
     private fun paramList(): List<Param> {
         eat(T.LPAREN)
         val ps = mutableListOf<Param>()
@@ -507,6 +575,34 @@ class Parser(source: String) {
             T.NULL -> { eat(); NullLit.also { it.line = tok.line; it.col = tok.col } }
             T.UNDEFINED -> { eat(); UndefinedLit.also { it.line = tok.line; it.col = tok.col } }
             T.THIS -> { eat(); ThisExpr.also { it.line = tok.line; it.col = tok.col } }
+            T.SUPER -> {
+                eat()
+                val next = peek()
+                when (next.type) {
+                    T.DOT -> {
+                        eat()
+                        val prop = memberNameOrKeyword()
+                        SuperMember(prop, false).pos(tok)
+                    }
+                    T.LBRACK -> {
+                        eat()
+                        val k = expression()
+                        eat(T.RBRACK)
+                        SuperMember("", true, k).pos(tok)
+                    }
+                    T.LPAREN -> {
+                        val args = callArgs()
+                        SuperCall(args).pos(tok)
+                    }
+                    else -> throw ParseError("'super' must be followed by '.', '[' or '('", tok.line, tok.col)
+                }
+            }
+            T.CLASS -> {
+                eat()
+                val nm = if (at(T.IDENT)) eat().value else null
+                val decl = classBody(nm, tok)
+                ClassExpr(decl).pos(tok)
+            }
             T.IDENT -> {
                 // Check for arrow fn (x) => ... / x => ...
                 if (peek(1).type == T.ARROW) {

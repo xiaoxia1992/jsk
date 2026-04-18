@@ -36,6 +36,37 @@ class EmptyStmt : Stmt()
 class Labeled(val label: String, val body: Stmt) : Stmt()
 
 /**
+ * ES2015 class declaration / expression.
+ *
+ * Our VM has no native class support; the Compiler desugars ClassDecl into a
+ * constructor function + a sequence of `.prototype.X =` / static assignments.
+ *
+ *  - [superClass]: optional parent class expression
+ *  - [members]: methods, getters/setters, and fields (static + instance)
+ *  - [constructor]: the `constructor` member lifted out for easy access; null
+ *    if none was written (in which case Compiler synthesizes a default one)
+ */
+class ClassDecl(
+    val name: String?,
+    val superClass: Expr?,
+    val constructor: ClassMember?,
+    val members: List<ClassMember>,
+) : Stmt()
+
+enum class MemberKind { METHOD, GETTER, SETTER, FIELD }
+
+class ClassMember(
+    val name: String,
+    val kind: MemberKind,
+    val isStatic: Boolean,
+    val isPrivate: Boolean,
+    /** For METHOD/GETTER/SETTER: the function literal. */
+    val func: FunctionExpr?,
+    /** For FIELD: the (optional) initializer. */
+    val fieldInit: Expr?,
+) : Node()
+
+/**
  * A function parameter.  Exactly one of [name] and [pattern] is non-null.
  * [default] is the default-value expression when the argument is undefined.
  * [rest] marks the trailing `...name` parameter collecting remaining args.
@@ -77,6 +108,12 @@ class ArrayLit(val elements: List<Expr?>) : Expr()
 class ObjectLit(val props: List<Pair<String, Expr>>) : Expr()
 class FunctionExpr(val name: String?, val params: List<Param>, val body: Block) : Expr()
 class ArrowFn(val params: List<Param>, val body: Node /* Expr or Block */) : Expr()
+/** Class used in expression position (`var C = class { … }`). Shares ClassDecl shape. */
+class ClassExpr(val decl: ClassDecl) : Expr()
+/** `super.foo` / `super[k]` — only valid inside methods of a class with a super. */
+class SuperMember(val prop: String, val computed: Boolean, val computedExpr: Expr? = null) : Expr()
+/** `super(...)` — only valid inside a subclass constructor. */
+class SuperCall(val args: List<Expr>) : Expr()
 class Unary(val op: String, val arg: Expr, val prefix: Boolean) : Expr()
 class Update(val op: String /* ++, -- */, val arg: Expr, val prefix: Boolean) : Expr()
 class Binary(val op: String, val left: Expr, val right: Expr) : Expr()

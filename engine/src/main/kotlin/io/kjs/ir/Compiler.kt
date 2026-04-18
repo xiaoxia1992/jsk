@@ -228,6 +228,18 @@ class Compiler private constructor(
             is Throw -> { compileExpr(s.arg); bytecode.emit(Op.THROW) }
             is Try -> compileTry(s)
             is FunctionDecl -> {} // already hoisted
+            is ClassDecl -> {
+                // Build the class value on the stack, then bind to its name in the
+                // current scope (local if inside a function, else global).
+                compileClass(s)
+                val nm = s.name ?: error("class declaration without name")
+                if (parent == null) {
+                    bytecode.emit(Op.DECL_GLOBAL, bytecode.strIdx(nm))
+                } else {
+                    val slot = scope.locals[nm] ?: declareLocal(nm)
+                    bytecode.emit(Op.STORE_LOCAL, slot); bytecode.emit(Op.POP)
+                }
+            }
             is Labeled -> { pendingLabel = s.label; compileStmt(s.body); pendingLabel = null }
             is Break -> {
                 val target = findLoop(s.label) ?: error("break target not found")
@@ -449,6 +461,212 @@ class Compiler private constructor(
         }
         walk(p)
         return out
+    }
+
+    // ---------- class support ----------
+
+    /** Stack entry tracking the innermost-enclosing class's super-binding name (null if no super). */
+    private data class ClassCtx(val superVarName: String?)
+    private val classStack = ArrayDeque<ClassCtx>()
+    private fun findClassCtx(): ClassCtx? {
+        // Walk up parent compilers too, so nested functions inside class methods still resolve super.
+        var c: Compiler? = this
+        while (c != null) {
+            if (c.classStack.isNotEmpty()) return c.classStack.last()
+            c = c.parent
+        }
+        return null
+    }
+
+    private var classUid = 0
+    private fun freshSuperName(): String = "__super${classUid++}__"
+
+    /** Emit bytecode that evaluates the class and leaves the constructor on the stack. */
+    private fun compileClass(decl: ClassDecl) {
+        // 1) evaluate super expression into a local slot (or push null if no super).
+        val superVarName: String? = if (decl.superClass != null) freshSuperName() else null
+        if (superVarName != null) {
+            compileExpr(decl.superClass!!)
+            val slot = declareLocal(superVarName, isConst = true)
+            bytecode.emit(Op.STORE_LOCAL, slot); bytecode.emit(Op.POP)
+        }
+
+        // 2) build constructor function. If the user wrote one use their body; otherwise
+        //    synthesize a default:
+        //      - subclass: super(...args);
+        //      - base:     (empty)
+        val instanceFields = decl.members.filter { !it.isStatic && it.kind == MemberKind.FIELD }
+        val ctor = buildClassCtorFunction(decl, instanceFields)
+
+        // Emit MAKE_CLOSURE for ctor. Push classCtx so any SuperCall/SuperMember in this
+        // or nested function bodies finds the super name.
+        classStack.addLast(ClassCtx(superVarName))
+        try {
+            val ctorBc = compileFunction(decl.name ?: "", ctor.params, ctor.body, isArrow = false)
+            bytecode.emit(Op.MAKE_CLOSURE, bytecode.fnIdx(ctorBc))
+        } finally {
+            classStack.removeLast()
+        }
+
+        // Stack: [ctor]
+        // Stash ctor in a scratch local for repeated use below.
+        val ctorSlot = declareScratchLocal()
+        bytecode.emit(Op.STORE_LOCAL, ctorSlot); bytecode.emit(Op.POP)
+
+        // 3) ctor.prototype = Object.create(super ? super.prototype : Object.prototype)
+        //    ctor.prototype.constructor = ctor
+        bytecode.emit(Op.LOAD_LOCAL, ctorSlot)
+        bytecode.emit(Op.LOAD_GLOBAL, bytecode.strIdx("Object"))
+        bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("create"))
+        if (superVarName != null) {
+            emitLoadIdent(superVarName, decl.line)
+            bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("prototype"))
+        } else {
+            bytecode.emit(Op.LOAD_GLOBAL, bytecode.strIdx("Object"))
+            bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("prototype"))
+        }
+        bytecode.emit(Op.CALL, 1)                 // stack: ctor, newProto
+        bytecode.emit(Op.STORE_PROP, bytecode.strIdx("prototype"))
+        bytecode.emit(Op.POP)                      // discard newProto leftover
+        // ctor.prototype.constructor = ctor
+        bytecode.emit(Op.LOAD_LOCAL, ctorSlot)
+        bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("prototype"))
+        bytecode.emit(Op.LOAD_LOCAL, ctorSlot)
+        bytecode.emit(Op.STORE_PROP, bytecode.strIdx("constructor"))
+        bytecode.emit(Op.POP)
+
+        // If super, inherit static members:  Object.setPrototypeOf(ctor, super)
+        if (superVarName != null) {
+            bytecode.emit(Op.LOAD_GLOBAL, bytecode.strIdx("Object"))
+            bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("setPrototypeOf"))
+            bytecode.emit(Op.LOAD_LOCAL, ctorSlot)
+            emitLoadIdent(superVarName, decl.line)
+            bytecode.emit(Op.CALL, 2)
+            bytecode.emit(Op.POP)
+        }
+
+        // 4) methods / accessors / static members
+        classStack.addLast(ClassCtx(superVarName))
+        try {
+            for (m in decl.members) {
+                when (m.kind) {
+                    MemberKind.METHOD -> {
+                        // target = isStatic ? ctor : ctor.prototype
+                        if (m.isStatic) bytecode.emit(Op.LOAD_LOCAL, ctorSlot)
+                        else {
+                            bytecode.emit(Op.LOAD_LOCAL, ctorSlot)
+                            bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("prototype"))
+                        }
+                        val fn = m.func!!
+                        val fnBc = compileFunction(m.name, fn.params, fn.body, isArrow = false)
+                        bytecode.emit(Op.MAKE_CLOSURE, bytecode.fnIdx(fnBc))
+                        bytecode.emit(Op.STORE_PROP, bytecode.strIdx(m.name))
+                        bytecode.emit(Op.POP)
+                    }
+                    MemberKind.FIELD -> {
+                        if (m.isStatic) {
+                            bytecode.emit(Op.LOAD_LOCAL, ctorSlot)
+                            if (m.fieldInit != null) compileExpr(m.fieldInit) else bytecode.emit(Op.LOAD_UNDEF)
+                            bytecode.emit(Op.STORE_PROP, bytecode.strIdx(m.name))
+                            bytecode.emit(Op.POP)
+                        } else {
+                            // instance field: handled inside ctor prelude (buildClassCtorFunction).
+                        }
+                    }
+                    MemberKind.GETTER, MemberKind.SETTER -> {
+                        // Simplified: store getter/setter as a regular method; a proper
+                        // Object.defineProperty-based accessor would be the spec path.
+                        if (m.isStatic) bytecode.emit(Op.LOAD_LOCAL, ctorSlot)
+                        else {
+                            bytecode.emit(Op.LOAD_LOCAL, ctorSlot)
+                            bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("prototype"))
+                        }
+                        val fn = m.func!!
+                        val fnBc = compileFunction(m.name, fn.params, fn.body, isArrow = false)
+                        bytecode.emit(Op.MAKE_CLOSURE, bytecode.fnIdx(fnBc))
+                        bytecode.emit(Op.STORE_PROP, bytecode.strIdx(m.name))
+                        bytecode.emit(Op.POP)
+                    }
+                }
+            }
+        } finally {
+            classStack.removeLast()
+        }
+
+        // 5) Leave ctor on the stack as the expression's value.
+        bytecode.emit(Op.LOAD_LOCAL, ctorSlot)
+    }
+
+    /**
+     * Construct a FunctionExpr-shape struct for the class's constructor.
+     * Instance fields (if any) are prepended as `this.x = init;` statements.
+     */
+    private fun buildClassCtorFunction(decl: ClassDecl, instanceFields: List<ClassMember>): FunctionExpr {
+        val stmts = mutableListOf<Stmt>()
+        // Instance field initializations: `this.name = init;` at top of body, *after* any
+        // explicit super() call if present.  For simplicity we place them at the start; user
+        // ctor body comes after.
+        for (f in instanceFields) {
+            val target = Member(ThisExpr, f.name, false)
+            val init = f.fieldInit ?: UndefinedLit
+            stmts.add(ExprStmt(Assign("=", target, init)))
+        }
+        if (decl.constructor != null) {
+            val fn = decl.constructor.func!!
+            stmts.addAll(fn.body.body)
+            return FunctionExpr(decl.constructor.name, fn.params, Block(stmts))
+        }
+        // Synthesize default constructor.
+        val params: List<Param>
+        if (decl.superClass != null) {
+            // Default for a subclass:  constructor(...args) { super(...args); }
+            params = listOf(Param("args", null, null, rest = true))
+            val argsIdent = Ident("args")
+            val spread = Unary("...", argsIdent, true)
+            stmts.add(ExprStmt(SuperCall(listOf(spread))))
+        } else {
+            params = emptyList()
+        }
+        return FunctionExpr(decl.name ?: "", params, Block(stmts))
+    }
+
+    /** `super.prop` → currentSuperVar.prototype.prop */
+    private fun compileSuperMember(e: SuperMember) {
+        val ctx = findClassCtx() ?: error("'super' used outside of a class")
+        val sn = ctx.superVarName ?: error("'super' used in a class without 'extends'")
+        emitLoadIdent(sn, e.line)
+        bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("prototype"))
+        if (e.computed) {
+            compileExpr(e.computedExpr!!)
+            bytecode.emit(Op.LOAD_ELEM)
+        } else {
+            bytecode.emit(Op.LOAD_PROP, bytecode.strIdx(e.prop))
+        }
+    }
+
+    /** `super(...args)` → superVar.call(this, ...args); leaves undefined on stack. */
+    private fun compileSuperCall(e: SuperCall) {
+        val ctx = findClassCtx() ?: error("'super()' used outside of a class")
+        val sn = ctx.superVarName ?: error("'super()' used in a class without 'extends'")
+
+        val hasSpread = e.args.any { it is Unary && it.op == "..." }
+        if (!hasSpread) {
+            // Emit: superVar.call(this, arg0, arg1, ...)
+            emitLoadIdent(sn, e.line)
+            bytecode.emit(Op.DUP)
+            bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("call"))
+            bytecode.emit(Op.GET_THIS)
+            for (a in e.args) compileExpr(a)
+            bytecode.emit(Op.CALL_METHOD, 1 + e.args.size)
+        } else {
+            // superVar.apply(this, argsArr)
+            emitLoadIdent(sn, e.line)
+            bytecode.emit(Op.DUP)
+            bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("apply"))
+            bytecode.emit(Op.GET_THIS)
+            emitBuildArgsArray(e.args)
+            bytecode.emit(Op.CALL_METHOD, 2)
+        }
     }
 
     private fun compileIf(s: If) {
@@ -693,6 +911,9 @@ class Compiler private constructor(
                 // After compileBindPattern, the consumed RHS copy is gone; the
                 // original DUP'd value remains as the expression result.
             }
+            is ClassExpr -> compileClass(e.decl)
+            is SuperMember -> compileSuperMember(e)
+            is SuperCall -> compileSuperCall(e)
         }
     }
 
@@ -901,6 +1122,39 @@ class Compiler private constructor(
 
     private fun compileCall(e: Call) {
         val hasSpread = e.args.any { it is Unary && it.op == "..." }
+        if (e.callee is SuperMember) {
+            // super.m(args) — must call with `this` bound to the current instance.
+            // Emit stack [obj=this, fn=_super.prototype[prop]] and CALL_METHOD.
+            val ctx = findClassCtx() ?: error("'super' used outside a class")
+            val sn = ctx.superVarName ?: error("'super' in a class without 'extends'")
+            val m = e.callee
+            bytecode.emit(Op.GET_THIS)                              // this
+            emitLoadIdent(sn, e.line)
+            bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("prototype"))
+            if (m.computed) { compileExpr(m.computedExpr!!); bytecode.emit(Op.LOAD_ELEM) }
+            else bytecode.emit(Op.LOAD_PROP, bytecode.strIdx(m.prop))
+            // Stack: this, fn
+            if (!hasSpread) {
+                for (a in e.args) compileExpr(a)
+                bytecode.emit(Op.CALL_METHOD, e.args.size, 0, e.line)
+            } else {
+                // Build args array and use fn.apply(this, argsArr). Need extra scratch.
+                val fnSlot = declareScratchLocal()
+                bytecode.emit(Op.STORE_LOCAL, fnSlot); bytecode.emit(Op.POP)   // stack: this
+                val thisSlot = declareScratchLocal()
+                bytecode.emit(Op.STORE_LOCAL, thisSlot); bytecode.emit(Op.POP) // stack: (empty)
+                emitBuildArgsArray(e.args)
+                val argsSlot = declareScratchLocal()
+                bytecode.emit(Op.STORE_LOCAL, argsSlot); bytecode.emit(Op.POP)
+                bytecode.emit(Op.LOAD_LOCAL, fnSlot)
+                bytecode.emit(Op.DUP)
+                bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("apply"))
+                bytecode.emit(Op.LOAD_LOCAL, thisSlot)
+                bytecode.emit(Op.LOAD_LOCAL, argsSlot)
+                bytecode.emit(Op.CALL_METHOD, 2, 0, e.line)
+            }
+            return
+        }
         if (e.callee is Member) {
             val m = e.callee
             compileExpr(m.obj); bytecode.emit(Op.DUP)       // obj, obj
@@ -912,11 +1166,9 @@ class Compiler private constructor(
                 bytecode.emit(Op.STORE_LOCAL, fnSlot); bytecode.emit(Op.POP)  // obj
                 val objSlot = declareScratchLocal()
                 bytecode.emit(Op.STORE_LOCAL, objSlot); bytecode.emit(Op.POP) // <empty>
-                // Build args array
                 emitBuildArgsArray(e.args)
                 val argsSlot = declareScratchLocal()
                 bytecode.emit(Op.STORE_LOCAL, argsSlot); bytecode.emit(Op.POP)
-                // fn.apply(obj, argsArr)
                 bytecode.emit(Op.LOAD_LOCAL, fnSlot); bytecode.emit(Op.DUP)
                 bytecode.emit(Op.LOAD_PROP, bytecode.strIdx("apply"))
                 bytecode.emit(Op.LOAD_LOCAL, objSlot)
@@ -929,10 +1181,9 @@ class Compiler private constructor(
         } else {
             compileExpr(e.callee)
             if (hasSpread) {
-                // Stack: fn.  Call fn.apply(undefined, argsArr).
                 val fnSlot = declareScratchLocal()
                 bytecode.emit(Op.STORE_LOCAL, fnSlot); bytecode.emit(Op.POP)
-                emitBuildArgsArray(e.args)                      // argsArr
+                emitBuildArgsArray(e.args)
                 val argsSlot = declareScratchLocal()
                 bytecode.emit(Op.STORE_LOCAL, argsSlot); bytecode.emit(Op.POP)
                 bytecode.emit(Op.LOAD_LOCAL, fnSlot); bytecode.emit(Op.DUP)

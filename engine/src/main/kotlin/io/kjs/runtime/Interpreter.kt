@@ -121,6 +121,7 @@ class Interpreter(val realm: Realm) {
             is Throw -> throw JsThrown(evalExpr(s.arg, env))
             is Try -> execTry(s, env)
             is FunctionDecl -> null // already hoisted
+            is ClassDecl -> throw JsThrown("class declarations only supported on the bytecode VM")
             is Labeled -> {
                 try { execStmt(s.body, env) }
                 catch (e: BreakSignal) { if (e.label != s.label) throw e }
@@ -232,6 +233,9 @@ class Interpreter(val realm: Realm) {
         is Sequence -> { var last: Any? = JsValues.UNDEFINED; for (it in e.items) last = evalExpr(it, env); last }
         is TemplateLit -> e.raw
         is DestructuringAssign -> throw JsThrown("destructuring assignment only supported on the bytecode VM")
+        is ClassExpr -> throw JsThrown("class expressions only supported on the bytecode VM")
+        is SuperMember -> throw JsThrown("'super' only supported on the bytecode VM")
+        is SuperCall -> throw JsThrown("'super()' only supported on the bytecode VM")
     }
 
     private fun evalUnary(e: Unary, env: Environment): Any? = when (e.op) {
