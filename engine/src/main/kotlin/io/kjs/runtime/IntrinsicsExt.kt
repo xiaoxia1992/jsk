@@ -18,6 +18,9 @@ object IntrinsicsExt {
         installPromise(realm)
         installProxy(realm)
         installReflect(realm)
+        installArrayBuffer(realm)
+        installTypedArrays(realm)
+        installDataView(realm)
     }
 
     private fun arg(args: List<Any?>, i: Int): Any? = if (i < args.size) args[i] else JsValues.UNDEFINED
@@ -739,5 +742,132 @@ object IntrinsicsExt {
             if (rv is JsObject) rv else inst
         })
         r.globalObject.set("Reflect", o); r.globalEnv.declare("Reflect", o)
+    }
+
+    // ---- ArrayBuffer ----
+    private class AbHolder(val bytes: ByteArray)
+    private fun installArrayBuffer(r: Realm) {
+        val proto = JsObject(r.objectProto); proto.className = "ArrayBuffer"
+        val ctor = JsFunction.native("ArrayBuffer", 1) { _, a ->
+            val n = JsValues.toInt32(arg(a, 0))
+            val o = JsObject(proto); o.className = "ArrayBuffer"
+            o.set("__ab__", AbHolder(ByteArray(n)))
+            o.set("byteLength", n.toDouble())
+            o
+        }
+        ctor.set("prototype", proto); proto.set("constructor", ctor)
+        proto.set("slice", fn("slice", 2) { self, a ->
+            val bytes = ((self as JsObject).get("__ab__") as AbHolder).bytes
+            val start = JsValues.toInt32(arg(a, 0)).coerceIn(0, bytes.size)
+            val end = if (arg(a, 1) == JsValues.UNDEFINED) bytes.size else JsValues.toInt32(arg(a, 1)).coerceIn(0, bytes.size)
+            val out = JsObject(proto); out.className = "ArrayBuffer"
+            out.set("__ab__", AbHolder(bytes.copyOfRange(start, end)))
+            out.set("byteLength", (end - start).toDouble())
+            out
+        })
+        r.globalObject.set("ArrayBuffer", ctor); r.globalEnv.declare("ArrayBuffer", ctor)
+    }
+
+    // ---- TypedArray constructors ----
+    private fun installTypedArrays(r: Realm) {
+        val specs = listOf(
+            "Int8Array" to Triple(JsTypedArray.Kind.INT8, 1, "int"),
+            "Uint8Array" to Triple(JsTypedArray.Kind.UINT8, 1, "int"),
+            "Int16Array" to Triple(JsTypedArray.Kind.INT16, 2, "int"),
+            "Uint16Array" to Triple(JsTypedArray.Kind.UINT16, 2, "int"),
+            "Int32Array" to Triple(JsTypedArray.Kind.INT32, 4, "int"),
+            "Uint32Array" to Triple(JsTypedArray.Kind.UINT32, 4, "int"),
+            "Float32Array" to Triple(JsTypedArray.Kind.FLOAT32, 4, "float"),
+            "Float64Array" to Triple(JsTypedArray.Kind.FLOAT64, 8, "float"),
+        )
+        for ((name, spec) in specs) {
+            val (kind, elemSize, _) = spec
+            val ctor = JsFunction.native(name, 1) { _, a ->
+                val v = arg(a, 0)
+                when (v) {
+                    // new Int32Array(n)  — length
+                    is Double, is Int, is Long -> {
+                        val n = JsValues.toInt32(v)
+                        val bytes = ByteArray(n * elemSize)
+                        JsTypedArray(bytes, 0, n, elemSize, kind).also { it.proto = r.objectProto }
+                    }
+                    // new Int32Array([...])
+                    is JsArray -> {
+                        val n = v.length
+                        val bytes = ByteArray(n * elemSize)
+                        val ta = JsTypedArray(bytes, 0, n, elemSize, kind).also { it.proto = r.objectProto }
+                        for (i in 0 until n) ta.set(i.toString(), v.get(i.toString()))
+                        ta
+                    }
+                    // new Int32Array(buffer[, offset[, length]])
+                    is JsObject -> if (v.className == "ArrayBuffer") {
+                        val bytes = (v.get("__ab__") as AbHolder).bytes
+                        val off = if (arg(a, 1) == JsValues.UNDEFINED) 0 else JsValues.toInt32(arg(a, 1))
+                        val len = if (arg(a, 2) == JsValues.UNDEFINED) (bytes.size - off) / elemSize else JsValues.toInt32(arg(a, 2))
+                        JsTypedArray(bytes, off, len, elemSize, kind).also { it.proto = r.objectProto }
+                    } else throw JsThrown("TypeError: cannot construct $name from this value")
+                    else -> throw JsThrown("TypeError: cannot construct $name from this value")
+                }
+            }
+            ctor.set("BYTES_PER_ELEMENT", elemSize.toDouble())
+            r.globalObject.set(name, ctor); r.globalEnv.declare(name, ctor)
+        }
+    }
+
+    // ---- DataView ----
+    private fun installDataView(r: Realm) {
+        val proto = JsObject(r.objectProto); proto.className = "DataView"
+        val ctor = JsFunction.native("DataView", 1) { _, a ->
+            val buf = arg(a, 0) as? JsObject ?: throw JsThrown("TypeError: DataView requires ArrayBuffer")
+            val bytes = (buf.get("__ab__") as? AbHolder)?.bytes ?: throw JsThrown("TypeError: DataView requires ArrayBuffer")
+            val off = if (arg(a, 1) == JsValues.UNDEFINED) 0 else JsValues.toInt32(arg(a, 1))
+            val len = if (arg(a, 2) == JsValues.UNDEFINED) bytes.size - off else JsValues.toInt32(arg(a, 2))
+            val o = JsObject(proto); o.className = "DataView"
+            o.set("__bytes__", bytes); o.set("byteOffset", off.toDouble()); o.set("byteLength", len.toDouble())
+            o
+        }
+        ctor.set("prototype", proto); proto.set("constructor", ctor)
+        fun bbOf(self: Any?): Pair<java.nio.ByteBuffer, Int> {
+            val o = self as JsObject
+            val bytes = o.get("__bytes__") as ByteArray
+            val off = JsValues.toInt32(o.get("byteOffset"))
+            return java.nio.ByteBuffer.wrap(bytes) to off
+        }
+        proto.set("getInt8",   fn("getInt8", 1)  { s, a -> val (b, off) = bbOf(s); b.get(off + JsValues.toInt32(arg(a, 0))).toDouble() })
+        proto.set("getUint8",  fn("getUint8", 1) { s, a -> val (b, off) = bbOf(s); (b.get(off + JsValues.toInt32(arg(a, 0))).toInt() and 0xFF).toDouble() })
+        proto.set("getInt16",  fn("getInt16", 1) { s, a ->
+            val (b, off) = bbOf(s); val le = JsValues.toBool(arg(a, 1))
+            b.order(if (le) java.nio.ByteOrder.LITTLE_ENDIAN else java.nio.ByteOrder.BIG_ENDIAN)
+            b.getShort(off + JsValues.toInt32(arg(a, 0))).toDouble()
+        })
+        proto.set("getInt32",  fn("getInt32", 1) { s, a ->
+            val (b, off) = bbOf(s); val le = JsValues.toBool(arg(a, 1))
+            b.order(if (le) java.nio.ByteOrder.LITTLE_ENDIAN else java.nio.ByteOrder.BIG_ENDIAN)
+            b.getInt(off + JsValues.toInt32(arg(a, 0))).toDouble()
+        })
+        proto.set("getFloat32", fn("getFloat32", 1) { s, a ->
+            val (b, off) = bbOf(s); val le = JsValues.toBool(arg(a, 1))
+            b.order(if (le) java.nio.ByteOrder.LITTLE_ENDIAN else java.nio.ByteOrder.BIG_ENDIAN)
+            b.getFloat(off + JsValues.toInt32(arg(a, 0))).toDouble()
+        })
+        proto.set("getFloat64", fn("getFloat64", 1) { s, a ->
+            val (b, off) = bbOf(s); val le = JsValues.toBool(arg(a, 1))
+            b.order(if (le) java.nio.ByteOrder.LITTLE_ENDIAN else java.nio.ByteOrder.BIG_ENDIAN)
+            b.getDouble(off + JsValues.toInt32(arg(a, 0)))
+        })
+        proto.set("setInt8",   fn("setInt8", 2)  { s, a ->
+            val (b, off) = bbOf(s); b.put(off + JsValues.toInt32(arg(a, 0)), JsValues.toInt32(arg(a, 1)).toByte()); JsValues.UNDEFINED
+        })
+        proto.set("setInt32",  fn("setInt32", 2) { s, a ->
+            val (b, off) = bbOf(s); val le = JsValues.toBool(arg(a, 2))
+            b.order(if (le) java.nio.ByteOrder.LITTLE_ENDIAN else java.nio.ByteOrder.BIG_ENDIAN)
+            b.putInt(off + JsValues.toInt32(arg(a, 0)), JsValues.toInt32(arg(a, 1))); JsValues.UNDEFINED
+        })
+        proto.set("setFloat64", fn("setFloat64", 2) { s, a ->
+            val (b, off) = bbOf(s); val le = JsValues.toBool(arg(a, 2))
+            b.order(if (le) java.nio.ByteOrder.LITTLE_ENDIAN else java.nio.ByteOrder.BIG_ENDIAN)
+            b.putDouble(off + JsValues.toInt32(arg(a, 0)), JsValues.toNumber(arg(a, 1))); JsValues.UNDEFINED
+        })
+        r.globalObject.set("DataView", ctor); r.globalEnv.declare("DataView", ctor)
     }
 }
