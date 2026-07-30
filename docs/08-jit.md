@@ -278,6 +278,85 @@ L21:
 
 > 这个端到端例子同时也是 §7"抽象解释如何投票出 double"的成品展示：正因为 `n`/`s`/`i` 三个局部都被投票为 DOUBLE，才有资格全程走 `DLOAD`/`DSTORE`。只要其中任何一个曾被赋过字符串或对象，它就会被降级成 `Object` 槽，上面那串 `D*` 立刻退化成 `ALOAD` + `JitBridge.add(...)`。
 
+看完这个例子，自然会冒出三个最根本的问题。下面三节逐一讲清——它们是理解整个 JIT 的钥匙。
+
+#### 2.4.7 解释器的栈 vs JIT 的栈：这是两个完全不同的栈
+
+最容易混淆的一点：**JIT 编译出来的代码，用的不是解释器那个"栈"**。
+
+- **解释器**执行 KJS 字节码时，操作数栈和局部变量表是**两个堆上的 `Object[]` 数组**：
+  - `frame.stack`：操作数栈，每个元素都是 `Double` 对象或别的对象（数字不会直接存成原生 `double`）；
+  - `frame.locals`：局部变量表，`var`/`let`、参数都躺这里。
+  
+  每次加法都得：弹两个 `Double` → `toNumber` → `Double.valueOf` 造新对象 → 压回。全是**数组下标访问 + 越界检查 + 堆分配**。
+
+- **JIT** 生成的 JVM 方法，跑在 **JVM 自己的操作数栈 + 局部变量槽**上：
+  - 操作数栈逻辑上在 JVM 栈帧里，**物理上 HotSpot 会尽量塞进 CPU 寄存器**；
+  - 局部变量用的是 JVM 的 **slot**（§2.4.1 那张表里从 6 号起的槽），double 类型就是原生 64 位浮点。
+
+**关键点**：JIT 编译完的代码，运行期**根本不再碰 `frame.stack` / `frame.locals` 这两个数组**，原来的 KJS 字节码数组也只充当"编译原料"，调用时没被读。对照前面的 `s = s + i`：
+
+| | 解释器 | JIT 生成代码 |
+|---|---|---|
+| "栈"在哪 | `frame.stack[ ]`（`Object[]` 堆数组） | **JVM 操作数栈**（寄存器里） |
+| `s`/`i` 存哪 | `frame.locals[ ]`（`Object[]` 堆数组） | **JVM 槽 8 / 10** |
+| 一次加法 | 弹 `Double`、弹 `Double`、**`Double.valueOf` 造对象**压回 | `DADD`：弹两个原生 double、相加、压回 |
+| 有无堆分配 | 每轮若干 `Double` 对象 | **0** |
+
+> 一句话：**不是同一个栈，也不是"JIT 自己的独立栈"——JIT 把 KJS 那个"堆数组当栈"的抽象，整张替换成了 JVM 原生栈/槽。** 拆掉 `Object[]` 这层，原生 `double` 就能在寄存器里一路流动，循环里的堆分配归零。这也正是 §5 第 3 点"去装箱 + 去数组访问"的来源。
+
+#### 2.4.8 外部参数怎么传进来：用 `Object[] argsArr` 桥接，而不是直接映射成 JVM 形参
+
+前面 2.4.4 的 prologue 里 `ALOAD 5; AALOAD; DSTORE 6` 把 `argsArr[0]` 搬进了槽 6（也就是 `n`）。这背后是一套标准的"动态语言 → 静态 JVM"桥接手法：
+
+**1. 外层 `invoke` 本身是按 JVM 约定调用的。** 生成的 `Compiled.invoke` 是个普通 JVM 实例方法，签名固定为 5 个形参（加上 `this` 共占槽 0–5）：
+
+```java
+Object invoke(Vm vm, Realm realm, Closure closure, Object thisVal, Object[] argsArr)
+```
+
+调用方（运行时 / 解释器）发起调用时，就按 JVM 标准约定把这 5 个实参压进 JVM 栈帧的槽 0–5，纯粹的标准调用。
+
+**2. 但 JS 自己的参数不对应 JVM 形参，而是打包进 `argsArr`。** `function sum(n)` 里的 `n` **不是** `invoke` 的某个 JVM 形参。因为 JS 函数参数数量、类型都是动态的，而 JVM 方法签名是编译期钉死的静态结构，两者对不上。所以工程上把**所有 JS 实参打包成 `Object[] argsArr`，作为一个 `Object` 整体传进来**：
+
+```
+JS 侧： sum(100)
+  └─> 运行时构造 argsArr = [100]（Object[] 数组）
+       └─> 按 JVM 约定调 compiled.invoke(vm, realm, closure, thisVal, argsArr)
+            └─> 进入方法体，prologue 拆包：
+                 ALOAD 5        ; 取 argsArr（槽 5）
+                 SIPUSH 0       ; 下标 0
+                 AALOAD         ; argsArr[0]
+                 INVOKESTATIC JitBridge.toD   ; 拆箱成原生 double
+                 DSTORE 6       ; n 进槽 6（KJS 槽 0 → JVM 槽 6）
+```
+
+`argsArr[0]` 就是 `n`，`argsArr[1]` 就是第二个参数……有多少个 JS 参数，就 `AALOAD` 几次、各进各的 JVM 槽（double 占 2 槽，见槽号表）。
+
+**3. 为什么不直接把参数摊成 JVM 形参？** 因为 JVM 方法签名编译期就固定了——`sum` 有 1 个参数、`add` 有 3 个参数就得生成不同签名，JIT 就没法用"一套固定 `invoke` 模板"服务所有函数了。用 `Object[] argsArr` 当统一入口后：
+
+- **签名永远一样**，一个 `invoke` 模板适配任意 JS 函数；
+- **参数个数任意**，几个都行，全塞数组；
+- **类型动态**：数组里是 `Object`，每个参数到底是不是 double 由 §7 抽象解释投票决定——是就 `JitBridge.toD` 拆箱走 `DSTORE`，不是就直接 `ASTORE` 留作对象。
+
+**4. 和解释器的一致性。** `argsArr` 这个名字两边是**同一个东西**：解释器 `frame.locals[i] = argsArr[i]`（数组访问，每值是 `Double` 对象）；JIT 从 `argsArr[i]` 拆出来进 JVM 槽。数据来源完全相同，只是"落地位置"不同（解释器落地在 `Object[]` 数组，JIT 落地在 JVM 原生槽）。这同样是 §6 语义一致性的体现——**同一份 `argsArr`，两种执行路径都认**。
+
+#### 2.4.9 JIT 到底是什么：模板翻译 + 两层 JIT
+
+把前面三节串起来，给"JIT"下一个完整定义：
+
+**它是模板（template）JIT：一条 KJS 字节码 → 一小段固定的 JVM 指令，一一对应，没有重排、没有跨指令优化。** 但要说清三点，免得理解偏：
+
+1. **是"一小段"不是"一条"**：每条 KJS 指令展开成它的专属模板。`ADD` 在 double 场景翻译成 `DADD`（1 条）；`STORE_LOCAL`（double 槽）翻译成 `DUP2; DSTORE; POP2`（3 条）；`RET` 翻译成 `Double.valueOf; ARETURN`（2 条）。翻译的粒度为**指令级**，不是字节级。
+
+2. **同一条指令，翻译结果取决于类型**：§7 的抽象解释先给每个局部投票出"double 还是 Object"，同一个 `ADD`：两边都 double → 发 `DADD`（快）；否则 → 先 `boxTopTwo` 装箱、再调 `JitBridge.add(...)`（慢，退化成"解释器式"调用）。所以"翻译"不是死板查表，而是**按类型选模板**。
+
+3. **不是每条都在循环里反复翻**：`prologue`（搬实参那段）只生成一次；循环体指令才跟着循环结构反复执行。JIT 生成的是**整个方法的代码**，循环在 JVM 层面就是 `L6:` + `GOTO L6` 的真实跳转，不是"每轮重新翻译"。
+
+**两层 JIT 的关系**（详见 §3.3）：KJS 自己做的这层叫**第一层 JIT**，本质是"机械翻译"——把每条 KJS 指令套模板展开成 JVM 字节码；真正把 `DUP2; POP2` 这类冗余消掉、把变量塞进 CPU 寄存器、做内联优化的，是 HotSpot 拿到这份 JVM 字节码后跑的 **C2 第二层 JIT**。
+
+> 一句话总结：JIT 把每条 KJS 指令按它的推断类型"套模板"展开成 JVM 原生指令，整段拼成普通 Java 方法；跑起来就不经过解释器的 `when(op)` 大分支和堆上操作数栈了——这正是它比解释器快的根本原因。
+
 ### 2.5 生成类的生命周期
 
 ```mermaid
