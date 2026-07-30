@@ -1,166 +1,112 @@
-# D0 · 总览：KJS 是什么 / 架构图 / 怎么跑
+# D0 · KJS 引擎总览与执行管线
 
-> 定位：这是文档第一篇，给想**快速看懂全貌**的人。读完后你应当知道 KJS 解决什么问题、
-> 由哪些模块拼成、怎么运行和调试。
+> 本篇是整套文档的入口，定位 KJS 是什么、由哪些模块组成、一段 `eval("1+2*3")` 在内部走过
+> 怎样一条管线。各模块的深入剖析见 D1–D10。
 
-## 1. 它是什么
+## 1. KJS 是什么
 
-KJS 是一个**手写的、运行在 JVM 上的 JavaScript 引擎**（对标 QuickJS 的架构思路，但实现语言是 Kotlin）。
-它不依赖任何 JS 库（无 GraalJS、无 Rhino），从词法分析一路写到虚拟机，自己把 JS 跑起来。
+KJS 是一个用 Kotlin 实现的小型 JavaScript 引擎，走**编译器 + 栈式虚拟机**路线（与 QuickJS、
+V8 Ignition 同源思路），同时保留一个**树遍历解释器**作为对照后端。它支持 ES5.1 实用子集 +
+若干 ES2015 特性（箭头函数、`let/const`、模板字符串、解构、class、for-of 等），足以跑通
+常见脚本与算法题。
 
-特性概览：
+工程结构：
 
-- **前端**：手写 Lexer + 递归下降 Parser，支持 ES5 语法 + 一批 ES2015+ 语法（箭头函数、
-  解构、`let/const`、`class`、模板字符串、`for-of/for-in`、可选链等）。
-- **中端**：AST → 紧凑的、三条并行 `IntArray` 车道的栈式字节码。
-- **后端（默认）**：一个 `while(true) when(op)` 的分发表虚拟机，带**属性内联缓存**和**帧池化**。
-- **性能内核**：热函数（默认被调用 ≥3 次）由 ASM 在运行时编译成 JVM 字节码，再由 HotSpot 编译成
-  机器码——相当于**免费拿到两级 JIT**。
-- **双后端**：保留一个 AST 树遍历解释器作为「正确性预言机」，可与 VM 对拍。
-- **教学模式**：`--trace` 能把 token → AST → 字节码 → 每一步栈的变化都打印出来。
-
-## 2. 五段执行管线
-
-```mermaid
-flowchart TD
-    subgraph 编译期["编译期（一次）"]
-      A[源码字符串] --> B[Lexer.tokenize<br/>→ List&lt;Token&gt;]
-      B --> C[Parser.parseProgram<br/>→ Program AST]
-      C --> D[Compiler.compileProgram<br/>→ Bytecode]
-    end
-    subgraph 运行期["运行期（每次执行）"]
-      D --> E[Vm.run<br/>栈式分发循环]
-      E --> F{热函数?}
-      F -- 是 --> G[Jit.requestCompile<br/>ASM → JVM 字节码]
-      G --> H[Compiled.invoke<br/>直接跑 JVM 栈]
-      H --> I[HotSpot C2 → 机器码]
-      F -- 否 --> E
-    end
-    E --> R[(Realm / JsObject<br/>JsArray / 原型链)]
-    I --> R
+```
+engine/
+  lex/      Lexer.kt           词法分析：源码 → Token 流
+  parse/    Ast.kt              AST 节点定义
+            Parser.kt          递归下降：Token → Program AST
+  ir/       Opcode.kt          字节码指令集（枚举）
+            Bytecode.kt        编译产物：三条并行 IntArray + 常量池
+            Compiler.kt        AST → Bytecode
+  vm/       Vm.kt              栈式虚拟机（解释器后端）
+            Jit.kt/Compiled.kt/JitBridge.kt  模板 JIT（D8）
+            PropIc.kt/GlobalIc.kt             内联缓存（D7）
+  runtime/  JsValue/JsObject/Realm/JsFunction  运行时值模型（D6）
+            Interpreter.kt     树遍历后端（D9）
+            Intrinsics*.kt     内置函数（D10）
+  Engine.kt                    对外门面
+cli/        Main.kt            CLI / REPL（D10）
+tests/      unit/              VM 与 Walker 对拍测试（D9）
 ```
 
-三段"车道"的设计是性能关键（见 D3）：
-字节码用 `codeA / aOpsA / bOpsA` 三个并行的 `IntArray` 存 opcode 和两个操作数，
-而不是每个指令一个对象，从而让 CPU 缓存友好、避免 GC 压力。
+## 2. 执行管线：源码如何变成结果
 
-## 3. 模块地图
-
-```mermaid
-graph TD
-    subgraph 入口
-      M[cli/Main.kt<br/>REPL / 文件运行器]
-      E[Engine.kt<br/>统一门面]
-    end
-    subgraph 前端
-      L[lex/Lexer.kt]
-      P[parse/Parser.kt + Ast.kt]
-    end
-    subgraph 中端
-      C[ir/Compiler.kt]
-      B[ir/Bytecode.kt + Opcode.kt]
-    end
-    subgraph 后端
-      V[vm/Vm.kt]
-      J[vm/Jit.kt + Compiled.kt + JitBridge.kt]
-      IC[vm/PropIc.kt + GlobalIc.kt]
-    end
-    subgraph 运行时
-      RV[runtime/JsValue/JsObject/JsArray/JsFunction/Realm.kt]
-      IN[runtime/Intrinsics.kt + IntrinsicsExt.kt + KjsNamespace.kt]
-      I[runtime/Interpreter.kt<br/>预言机后端]
-    end
-    M --> E
-    E --> L
-    E --> P
-    E --> C
-    E --> V
-    E --> I
-    C --> B
-    V --> IC
-    V --> J
-    V --> RV
-    V --> IN
-```
-
-- `engine/`：引擎核心（上述所有模块）。
-- `cli/`：命令行入口与 REPL。
-- `tests/`：单测 + VM/Walker 对拍 corpus。
-- 根目录的 `kjs` 脚本 / `bench-*.js`：运行与基准测试脚本。
-
-## 4. `Engine` 门面
-
-所有入口都收敛到 `Engine`（见 `Engine.kt:27`）：
+门面 `Engine`（`Engine.kt:27`）把五段串起来。`eval`（`Engine.kt:44`）只做四件事：
 
 ```kotlin
-12:26:engine/src/main/kotlin/io/kjs/Engine.kt
-class Engine(
-    backend: Backend = defaultBackend(),
-    trace: Boolean = false,
-) {
-    enum class Backend { Vm, Walker }   // 两个后端
-    val realm: Realm = Realm()
-    private val walker: Interpreter = Interpreter(realm)
-    private val vm: Vm = Vm(realm)
-    ...
-    fun eval(source: String): Any? {
-        val tokens = Lexer(source).tokenize()          // 1) 词法
-        val program = Parser(source).parseProgram()     // 2) 语法
-        return when (mode) {                            // 3) 执行
-            Backend.Walker -> walker.exec(program)
-            Backend.Vm -> {
-                val bc = Compiler.compileProgram(program, source)
-                vm.run(bc)
-            }
+44:60:engine/src/main/kotlin/io/kjs/Engine.kt
+fun eval(source: String): Any? {
+    val tokens = Lexer(source).tokenize()        // ① 词法
+    tracer?.onTokens(tokens)
+    val program = Parser(source).parseProgram()  // ② 语法
+    tracer?.onAst(program)
+    return when (mode) {
+        Backend.Walker -> walker.exec(program).also { tracer?.onResult(it) }   // ③a 树遍历
+        Backend.Vm -> {                                                     // ③b 编译 + 解释
+            val bc = Compiler.compileProgram(program, source)
+            tracer?.onBytecode(bc)
+            tracer?.onVmEnter(bc)
+            vm.run(bc).also { tracer?.onResult(it) }
         }
     }
 }
 ```
 
-注意 `eval` 里 Lexer 和 Parser 是**分别**对源码做的（`Parser` 内部自己重做词法，
-注释里说"for demo purposes"）。两条管线输入同一字符串，互不直接耦合。
-
-后端切换由环境变量 `KJS_BACKEND` 控制（`Engine.kt:69`）：
-
-```kotlin
-69:75:engine/src/main/kotlin/io/kjs/Engine.kt
-private fun defaultBackend(): Backend =
-    when (System.getenv("KJS_BACKEND")?.lowercase()) {
-        "walker", "ast" -> Backend.Walker
-        else -> Backend.Vm
-    }
+```mermaid
+flowchart LR
+    S["源码 String"] --> L["Lexer.tokenize()\nToken 列表"]
+    L --> P["Parser.parseProgram()\nProgram AST"]
+    P -->|Walker| W["Interpreter.exec()\n树遍历求值"]
+    P -->|Vm| C["Compiler.compileProgram()\nBytecode"]
+    C --> V["Vm.run()\n逐条执行指令"]
+    W --> R["结果 Any?"]
+    V --> R
 ```
 
-## 5. 怎么跑 / 怎么调试
+管线五段：
 
-```bash
-# 交互式 REPL
-./kjs
-# 运行文件
-./kjs script.js
-# 运行内联代码
-./kjs -e '1 + 2 * 3'
-# 教学模式：把 token→AST→字节码→VM 每步都打印出来
-./kjs --trace -e 'let a = [1,2,3]; a.map(x => x*2)'
+1. **词法（Lexer）**：字符流 → `Token` 列表。难点是 `/` 是"除号"还是"正则起始"的歧义，靠
+   "上一个有效 token 类型"判断（D1）。
+2. **语法（Parser）**：`Token` → `Program` AST。递归下降 + 优先级爬升，把 `for-of`、解构、模板
+   等语法糖在 AST 阶段就部分展开（D2）。
+3. **编译（Compiler）**：`Program` → `Bytecode`。按函数切分编译单元，做作用域/槽位分配、变量
+   提升、Upvalue 闭包解析、跳转修补，并把 `class` 解语法糖为构造函数（D4）。
+4. **字节码（Bytecode）**：三条并行 `IntArray`（opcode / 操作数 A / 操作数 B）+ 常量池，VM 直接
+   按索引连续读取，零装箱（D3）。
+5. **执行（Vm / Interpreter）**：`Bytecode` → 结果。默认走 VM（D5）；`Walker` 后端直接遍历 AST
+   求值，作为"预言机"与 VM 对拍验证正确性（D9）。
+
+## 3. 双后端：同一个 API，两种实现
+
+`Engine.Backend`（`Engine.kt:31`）枚举 `Vm` 与 `Walker`。二者共享 AST 与运行时值模型，仅"执行"
+这一步不同：
+
+- **Vm（默认）**：编译成字节码后用栈式 VM 执行，可被 JIT 进一步加速（D8），性能更好，是正式路径。
+- **Walker**：`Interpreter.exec(program)` 直接递归遍历 AST 求值，实现简单、正确性强，留作
+  对照/兜底，也用于 `evalToString` 之外的兼容性校验。
+
+后端可运行时切换（`setBackend`，`Engine.kt:42`），也可用环境变量 `KJS_BACKEND=walker`（或 `ast`）
+在启动时默认选 Walker（`Engine.kt:70`）。D9 详述二者如何通过共享 `JsValue` 模型做差分测试。
+
+## 4. 门面还做了什么
+
+- **`Realm`**（`Engine.kt:33`）：一次执行会话的全局状态（全局对象、原型、`Object/Array/...`
+  内置构造器），VM 与 Walker 共用。详见 D6。
+- **`Tracer`**：传入 `trace=true`（`Engine.kt:38`）即安装，逐阶段回调 `onTokens/onAst/onBytecode/
+  onVmStep/onResult`，把词法→语法→编译→VM 步进完整旁白打印出来，是学习引擎内部运行的利器。
+- **`evalToString`**（`Engine.kt:63`）：包一层 `JsValues.toStr`，并把 `JsThrown` 渲染成
+  `"Uncaught ..."`，方便 REPL 与断言。
+- **`VISUAL`/`eval` 返回值**：`eval` 直接返回 `Any?`（底层是 `JsValue` 体系里的盒装值，D6），
+  顶层程序的最后一个表达式值通过 `STASH_RESULT`/`HALT` 落到 `frame.lastResult`（见 D5 §6）。
+
+## 5. 这套文档的阅读顺序
+
+```
+D0 总览 → D1 Lexer → D2 Parser/AST → D3 字节码 → D4 编译器 → D5 虚拟机
+       → D6 运行时值模型 → D7 内联缓存 → D8 模板 JIT → D9 双后端对拍 → D10 内置库与 CLI
 ```
 
-`Tracer`（`Engine.kt:38` 注入到 `vm.tracer`）在四个节点输出：
-`onTokens / onAst / onBytecode / onVmEnter / onResult`，是理解整个管线的"放大镜"。
-
-## 6. 设计取舍速记
-
-- **为什么是栈式字节码而不是 AST 直跑？** 栈式字节码分发表编译成 JVM `tableswitch` 后很紧凑，
-  且比递归解释 AST 快得多（见 D5 实测数字）。
-- **为什么保留 Walker？** 它慢但对"语义对不对"提供了一个独立实现，作为 VM 的 oracle（见 D9）。
-- **为什么两层 JIT？** 第一层（KJS→JVM 字节码）由我们控制、可做类型特化；第二层（JVM→native）
-  免费由 HotSpot 提供。我们几乎"白嫖"了 C2 的优化。
-
-## 7. 接下来读什么
-
-- 想看"输入怎么被切碎"→ **D1 Lexer**
-- 想看"碎片怎么拼成树"→ **D2 Parser/AST**
-- 想看"树怎么变字节码"→ **D4 Compiler**（先看 D3 字节码）
-- 想看"字节码怎么跑"→ **D5 Vm**
-- 想看"值长什么样"→ **D6 运行时值模型**
-- 想看"快在哪"→ **D7 IC → D8 JIT**
-- 想看"怎么保证没写错"→ **D9 对拍**
+建议按此顺序读：前半段是"源码如何变成可执行字节码"（D1–D4），D5 是执行核心，后半段是支撑
+机制（值模型、IC、JIT）与正确性保障（双后端）。每篇都带可点击的源文件行号与 Mermaid 图。

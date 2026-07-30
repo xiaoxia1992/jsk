@@ -1,37 +1,51 @@
-# KJS 实现文档（由浅入深）
+# KJS 引擎实现文档
 
-KJS 是一个**用 Kotlin 写在 JVM 上的 JavaScript 引擎**：手写词法/语法分析生成 AST →
-字节码编译器 → 基于栈的虚拟机（带属性内联缓存），并对热函数做运行时 JIT（ASM → JVM
-字节码 → HotSpot C2 两级编译）。支持 ES5 + ES2015+ 的实用子集，并带 `--trace` 教学模式。
+> 一套面向**实现者**的 KJS 源码剖析文档，由浅入深，每篇都带可点击的源文件行号与 Mermaid 图。
+> 目标不是"怎么用 KJS"，而是"KJS 内部怎么跑起来"。
 
-## 文档导航（按难度递增）
+## 执行管线总览
 
-| 编号 | 文档 | 主题 | 关键源文件 |
-|------|------|------|-----------|
-| D0 | [总览](00-overview.md) | 引擎定位、五段管线、模块地图、如何运行 | `Engine.kt` |
-| D1 | [词法分析 Lexer](01-lexer.md) | Token 设计、正则/除法歧义、字面量 | `lex/Lexer.kt` |
-| D2 | [AST 与语法分析 Parser](02-parser-ast.md) | 节点模型、递归下降、运算符优先级 | `parse/Ast.kt`、`parse/Parser.kt` |
-| D3 | [字节码与指令集](03-bytecode.md) | 三条并行 IntArray 车道、常量/函数池、IC 槽 | `ir/Bytecode.kt`、`ir/Opcode.kt` |
-| D4 | [AST → 字节码编译器](04-compiler.md) | 作用域/槽分配、Upvalue、hoisting、跳转修补 | `ir/Compiler.kt` |
-| D5 | [栈式虚拟机 Vm](05-vm.md) | 分发循环、帧池化、调用约定、异常处理器 | `vm/Vm.kt` |
-| D6 | [运行时值模型](06-runtime-values.md) | 装箱表示、原型链、作用域、类型强制 | `runtime/JsValue.kt` 等 |
-| D7 | [内联缓存](07-inline-cache.md) | 单态 IC、PropIc/GlobalIc、megamorphic 回退 | `vm/PropIc.kt`、`vm/GlobalIc.kt` |
-| D8 | [模板 JIT 编译器](08-jit.md) | 异步编译、类型特化、栈类型追踪、两级 JIT | `vm/Jit.kt`、`vm/Compiled.kt` |
-| D9 | [双后端与对拍](09-dual-backend.md) | 树遍历 oracle、后端切换、零分歧对拍 | `runtime/Interpreter.kt`、`tests/` |
-| D10 | [内置库与宿主嵌入](10-intrinsics-cli.md) | Intrinsics、KjsNamespace、CLI/REPL | `runtime/Intrinsics*.kt`、`cli/` |
-
-## 核心管线一览
-
-```mermaid
-flowchart LR
-    SRC[源码 .js] --> LEX[Lexer 词法分析]
-    LEX -->|Token 流| PAR[Parser 语法分析]
-    PAR -->|AST| CMP[Compiler 编译]
-    CMP -->|字节码 Bytecode| VM[Vm 栈式虚拟机]
-    VM -->|JIT 触发| JIT[ASM 生成 JVM 字节码]
-    JIT -->|Compiled 子类| HOT[HotSpot C2 机器码]
-    VM -->|运行时值| RT[(Realm / JsObject 等)]
-    VM -.trace.-> TR[Tracer 教学输出]
+```
+源码 String
+  → Lexer.tokenize()        [D1 词法]
+  → Parser.parseProgram()   [D2 语法/AST]
+  → Compiler.compileProgram()  [D4 编译]
+  → Bytecode                [D3 字节码]
+  → Vm.run() / Interpreter.exec()   [D5 虚拟机] / [D9 双后端]
+  → 结果 Any?
 ```
 
-> 行号引用基于仓库当前状态，可能随演进偏移；以函数名/文件名定位最稳妥。
+支撑机制：**运行时值模型（D6）** 是 VM 与 Walker 共享的地基；**内联缓存（D7）** 与
+**模板 JIT（D8）** 是性能内核；**双后端对拍（D9）** 保证正确性。
+
+## 文档导航
+
+| 文件 | 主题 | 核心源文件 |
+|---|---|---|
+| [`00-overview.md`](00-overview.md) | 总览：定位、五段管线、模块地图、`Engine` 门面、如何运行 | `Engine.kt` |
+| [`01-lexer.md`](01-lexer.md) | 词法：Token 模型、`/` 除号 vs 正则歧义、数字/字符串/模板 | `lex/Lexer.kt` |
+| [`02-parser-ast.md`](02-parser-ast.md) | 语法：递归下降、优先级爬升、解构/箭头/`for-of` 解糖、AST 节点 | `parse/Parser.kt`、`Ast.kt` |
+| [`03-bytecode.md`](03-bytecode.md) | 字节码：三条并行 IntArray 车道、常量池、跳转修补、反汇编 | `ir/Bytecode.kt`、`Opcode.kt` |
+| [`04-compiler.md`](04-compiler.md) | 编译：作用域/槽位、Upvalue 闭包、提升、跳转修补、class 解糖 | `ir/Compiler.kt` |
+| [`05-vm.md`](05-vm.md) | 虚拟机（核心）：Frame 模型、调用建退帧、参数/返回值/局部表、分发循环、闭包、IC、异常、迭代 | `vm/Vm.kt` |
+| [`06-runtime-values.md`](06-runtime-values.md) | 值模型：`Any?` 装箱、`Undefined` 哨兵、原型链、`Environment`、类型强制 | `runtime/JsValue.kt` 等 |
+| [`07-inline-cache.md`](07-inline-cache.md) | 内联缓存：单态 `PropIc`、多态/megamorphic、`GlobalIc` | `vm/PropIc.kt`、`GlobalIc.kt` |
+| [`08-jit.md`](08-jit.md) | 模板 JIT：异步编译、类型特化消除装箱、栈类型追踪、ASM 生成 | `vm/Jit.kt`、`Compiled.kt`、`JitBridge.kt` |
+| [`09-dual-backend.md`](09-dual-backend.md) | 双后端：树遍历 oracle、VM vs Walker 对拍测试 | `runtime/Interpreter.kt`、`tests/` |
+| [`10-intrinsics-cli.md`](10-intrinsics-cli.md) | 内置函数与 CLI：`JsFunction.native`、Intrinsics/Ext、KjsNamespace、CLI/REPL | `runtime/Intrinsics*.kt`、`cli/` |
+
+## 推荐阅读顺序
+
+```
+D0 总览 → D1 词法 → D2 语法 → D3 字节码 → D4 编译器 → D5 虚拟机
+     → D6 值模型 → D7 内联缓存 → D8 模板 JIT → D9 双后端对拍 → D10 内置库与 CLI
+```
+
+前半段讲"源码如何变成可执行字节码"（D1–D4），D5 是执行核心，后半段讲支撑机制（值模型、IC、JIT）
+与正确性保障（双后端）。每篇末尾都有"设计取舍"与"常见坑"。
+
+## 配合 Tracer 学习
+
+`Engine(trace = true)`（或 CLI 的 `kjs --trace -e '...'`）会把**词法 → 语法 → 编译 → VM 步进**
+完整打印，是边读文档边看真实执行流的最佳方式。详见 [`00-overview.md`](00-overview.md) 与
+[`10-intrinsics-cli.md`](10-intrinsics-cli.md)。

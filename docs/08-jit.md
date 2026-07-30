@@ -1,196 +1,168 @@
 # D8 · 模板 JIT 编译器
 
-> 前置知识：D3、D5、D7。本篇讲"快的关键之二"：把热字节码在运行时变成 JVM 字节码，再白嫖 HotSpot C2。
+> 前置知识：D3（字节码）、D5（VM）、D7（内联缓存）。
+>
+> 本篇拆解 `vm/Jit.kt`、`vm/Compiled.kt`、`vm/JitBridge.kt`：KJS 如何把字节码**在运行时翻译成
+> JVM 字节码**（模板 JIT），并通过**类型特化**消除热点数值循环的装箱开销。读完能理解"解释器为何
+> 能快一个数量级"。
 
-## 1. 两级 JIT 直觉
+## 1. 总体策略：每函数一个生成的类
+
+`Jit`（`Jit.kt:42`）是单例。它用 ASM 把每个 `Bytecode` 翻译成一个 `Compiled` 子类（`Jit.kt:18`）：
+
+- **KJS 操作数栈 → JVM 操作数栈**：`push/pop` 直接映射成 JVM 栈指令，无额外数组。
+- **KJS 局部变量槽 → JVM 局部变量槽**：`locals[i]` 映射到 `localSlot[i]`，`double` 局部占 2 个 JVM 槽。
+- 只编译**受支持的操作码子集**（算术、比较、局部读写、常量、跳转、`RET`、`CALL argc≤4` 等，
+  `Jit.kt:110`）；遇到不支持的（如 `MAKE_CLOSURE`、属性赋值、迭代协议）函数**整体被拒绝**，
+  继续走解释器——正确性零损失。
+
+`Compiled`（`Compiled.kt:14`）只有一个抽象方法 `invoke(vm, realm, closure, thisVal, args)`，VM 在
+函数变热后直接调它（D5 §3 的 `already.invoke(...)`），绕过 `when(op)` 分发循环。
+
+## 2. 异步编译：变热才编译
+
+`threshold = 3`（`Jit.kt:43`，可用 `KJS_JIT_THRESHOLD` 调）。VM 每次解释调用 `hotness++`（`D5 §3`），
+`shouldCompile`（`Jit.kt:57`）在 `hotness == threshold` 时触发：
+
+```kotlin
+79:101:engine/src/main/kotlin/io/kjs/vm/Jit.kt
+fun requestCompile(closure: VmClosure) {
+    if (closure.compilePending || closure.compiled != null || closure.jitRejected) return
+    if (!canCompile(closure.bc)) { closure.jitRejected = true; return }
+    closure.compilePending = true
+    val task = Runnable {
+        val compiled = compile(closure.bc)
+        closure.compiled = compiled         // 发布( volatile 写)
+    }
+    if (asyncDisabled) task.run() else compilerPool.execute(task)   // 默认单线程守护线程
+}
+```
+
+要点：
+- **先 `canCompile` 把关**（`Jit.kt:132`）：扫描每条 opcode，无不支持的、`CALL` 的 `argc≤4`（`MAX_JIT_CALL_ARGC`，`Jit.kt:130`）才允许；否则 `jitRejected=true`，永不重试。
+- **异步后台编译**：默认提交到单线程守护线程池（`Jit.kt:65`），编译完成把 `Compiled` 发布到
+  `closure.compiled`（volatile 写）。**编译期间函数仍由解释器执行**，编译好了下一次调用自动走 JIT。
+- `KJS_JIT_ASYNC=off` 可强制同步编译（调试用）。
+- 可用 `KJS_JIT=off`、`KJS_JIT_VERBOSE`、`KJS_JIT_LOG` 等环境变量观察/关闭 JIT（D5/D0）。
+
+## 3. 类型特化：消除装箱（核心原理）
+
+解释器里每个数字都是 `Any?` 装箱（`Double`），加法要 `unbox + dadd + box`。JIT 的关键是：**把那些
+"只用数字"的局部与栈顶，提升到原生 `double` JVM 槽 + 原生 `DADD`**，从而热点循环零装箱。
+
+### 3.1 抽象解释：`inferDoubleLocals`（`Jit.kt:161`）
+
+编译前先做一遍**单遍抽象解释**，给每个 KJS 局部投"能否用 `double`"的票（`vote`）：
+
+- 每个 `STORE_LOCAL` 压的值若是 `DOUBLE` 链上的（来自 `LOAD_ZERO/ADD/...`），该槽投"可 double"；
+  一旦某次 store 压了非数字，票降到 0（不可）。
+- **参数初始视为 DOUBLE 候选**（`Jit.kt:168`），若后续流经非数字运算则降级。
+- **固定点迭代**：`while (changed && rounds < 8)`（`Jit.kt:189`），`vote` 单调 1→0 不回弹，快速收敛。
+- **分支目标处重置抽象栈**（`Jit.kt:173`/`Jit.kt:200`）：`JMP/JT/JF` 的跳转目标 `isTarget` 处把抽象
+  栈清空，避免跨分支类型错配。
+
+最终 `res[i] = (vote[i] == 1)` 决定局部 `i` 是否用原生 `double` 槽。
+
+### 3.2 发射期栈类型追踪
+
+`emitBody`（`Jit.kt:359`）维护一个与 JVM 操作数栈平行的**抽象栈** `aStack`（元素 `T.ANY/DOUBLE/BOOL`，
+`Jit.kt:357`），并用一组强制转换助手保持二者同步：
+
+- `boxTop`：把栈顶 `DOUBLE/BOOL` 装箱成 `Object`（`Double.valueOf`/`Boolean.valueOf`）。
+- `toDouble`：`ANY → bridge.toD`（兜底 `JsValues.toNumber`）、`BOOL → I2D`；`DOUBLE` 不动。
+- `toBoolPrim`：转原生 `int` 0/1。
+- `boxTopTwo` / `boxAllStack`：在二元运算、分支前把需要的栈顶统一装箱。
 
 ```mermaid
-flowchart LR
-    subgraph KJS层
-      BC[Bytecode 字节码] -->|热函数命中| GEN[ASM 生成 JVM 字节码]
-    end
-    subgraph JVM层
-      GEN --> JVM[JVM 解释/Client 编译]
-      JVM -->|热点| C2[HotSpot C2 → 机器码]
-    end
-    BC -.冷.-> VM[Vm 栈式解释]
+flowchart TD
+    INFER["inferDoubleLocals: 投票哪些 local 可 unbox"] --> EMIT["emitBody: 逐 pc 发射"]
+    EMIT -->|栈顶两值皆 DOUBLE| NAT["DADD/DSUB… 原生双精度"]
+    EMIT -->|否则| BR["JitBridge.add/sub… 走 Any? 慢路径"]
+    NAT --> C2["HotSpot C2 内联优化 → XMM 寄存器"]
+    BR --> C2
 ```
 
-- **第一级（我们做）**：KJS 把热函数的字节码翻译成 JVM 字节码（`.class` 形态，常驻内存，不落盘）。
-- **第二级（JVM 免费做）**：生成的 JVM 字节码被 HotSpot 当成普通 Java 方法，C2 再编译成机器码。
+### 3.3 原生算术 / 比较
 
-于是 KJS 只需实现"字节码→JVM 字节码"这一步，**机器码优化（内联、逃逸分析、寄存器分配）全部免费**。
+- **`ADD`**（`Jit.kt:651`）：若抽象栈顶两值都是 `DOUBLE`，直接 `DADD` 并保留 `DOUBLE` 标签；否则
+  `boxTopTwo` + `JitBridge.add`（处理字符串拼接与兜底）。`SUB/MUL/DIV/MOD` 经 `emitArith`（`Jit.kt:830`）
+  同构。
+- **`LT/LE/GT/GE`** 经 `emitCompare`（`Jit.kt:880`）：双精度走 `DCMPL + IF_icmp`，否则 `JitBridge.lt`；
+  比较结果标 `BOOL`。
+- **`STORE_LOCAL`**（`Jit.kt:569`）：若该槽是 `double`，先 `toDouble` 再 `DSTORE`（并 `DUP2` 保留一份
+  供抽象栈）。
 
-## 2. 触发：异步编译管线
+于是 `sumN`/`poly`/`square` 这类热点数值循环，每次迭代都是纯原生 `double` 运算，**完全不碰堆**，
+HotSpot C2 进一步把它们优化进 XMM 寄存器（`Jit.kt:38` 注释）。
 
-`Jit`（`vm/Jit.kt:20`）监听函数调用计数。热函数（默认 `callCount >= 3`）被提交到
-专用编译线程 `kjs-jit-compiler`：
+## 4. 属性访问与原型链：复用同一份 IC
+
+`LOAD_PROP` 不是把属性查找逻辑内联进生成代码，而是调用 `JitBridge.loadProp`（`Jit.kt:603`、`JitBridge.kt:98`）。
+关键点：**`loadProp` 走 `closure.bc.caches[pc]` 的同一个 `PropIc`**（D7 §2）——VM 与 JIT 共享一份
+内联缓存。该桥接方法是 `static`、小且单态，HotSpot 能把它内联回生成代码，使单态属性站点几乎零
+开销。`LOAD_GLOBAL` 同样走 `JitBridge.loadGlobal`（`JitBridge.kt:78`），复用 `Environment` 链与
+`GlobalIc`。
+
+`CALL`（`Jit.kt:750`）因参数要装成 `Object[]`，生成代码用 `JitBridge.argsOfN`（`argsOf0..argsOf4`，
+`JitBridge.kt:146`）+ `invokeCall2`（`JitBridge.kt:142`）转交 VM 的 `invokeFast`——所以 JIT 调用
+其它函数时仍走统一的调用约定（D5 §4），被调函数自己可能也已 JIT 化。
+
+## 5. 编译：特化优先，失败回退
+
+`compile`（`Jit.kt:291`）两阶段尝试：
 
 ```kotlin
-20:55:engine/src/main/kotlin/io/kjs/vm/Jit.kt
-object Jit {
-    private val queue = LinkedBlockingQueue<CompileTask>()
-    private val thread = Thread({ compileLoop() }, "kjs-jit-compiler")
-    fun maybeCompile(closure: JsClosure) {
-        if (closure.callCount < HOT_THRESHOLD) return   // 默认 3
-        if (closure.compiled != null || closure.compiling) return
-        closure.compiling = true
-        queue.offer(CompileTask(closure))
-    }
-    private fun compileLoop() {
-        for (task in queue) {
-            val c = tryCompile(task.closure) ?: continue
-            task.closure.compiled = c          // 编译完原子替换
-        }
-    }
+295:353:engine/src/main/kotlin/io/kjs/vm/Jit.kt
+while (true) {
+    val specialize = attempt == 0 && !specDisabled
+    val doubleLocals = if (specialize) inferDoubleLocals(bc) else BooleanArray(bc.localCount)
+    // ... ASM 生成 ClassWriter ...
+    try { /* emitBody; 若类型特化遇到未覆盖情形抛 JitAbort */ }
+    catch (abort: JitAbort) { attempt++; if (attempt > 1) throw ...; continue }   // 重试非特化
+    val cls = try { JitClassLoader.define(...) }
+              catch (vfy: VerifyError) { attempt++; if (attempt>1) throw vfy; continue }  // 校验失败重试非特化
+    cls.getDeclaredField("CONSTS").set(null, bc.constants.toTypedArray())
+    cls.getDeclaredField("STRINGS").set(null, bc.strings.toTypedArray())
+    return cls.getDeclaredConstructor().newInstance() as Compiled
 }
 ```
 
-关键点：**异步 + 不阻塞 VM**。编译在后台线程进行，VM 继续用解释器跑；编译完成把
-`closure.compiled` 填上。`CALL` 分派时优先用 `compiled`（`Compiled` 子类），否则回退解释器。
+- **先尝试类型特化**（attempt 0）：`inferDoubleLocals` 决定 unbox。若发射中遇到无法特化的情形
+  （如 `double` 埋在栈太深，`Jit.kt:769` 抛 `JitAbort`），**回退到全装箱（attempt 1）**。
+- **JVM 校验失败**（VerifyError，如栈类型推断冲突）：同样回退非特化。
+- `JitClassLoader`（`Jit.kt:939`）是 child-first 类加载器，`defineClass` 注册生成类。
+- 常量池/字符串池写入生成类的 `static` 字段 `CONSTS/STRINGS`（`Jit.kt:311`），`LOAD_CONST/STR` 直接
+  `GETSTATIC + AALOAD` 取，避免每次经桥接方法。
 
-```mermaid
-sequenceDiagram
-    participant V as Vm (主线程)
-    participant Q as Jit 队列
-    participant C as kjs-jit-compiler 线程
-    participant HC as HotSpot
-    V->>V: 第1/2次调用→解释器跑, callCount++
-    V->>Q: 第3次→maybeCompile 入队
-    V->>V: 继续解释器跑
-    Q->>C: 取出任务
-    C->>C: ASM 生成 JVM 字节码 → Compiled
-    C->>V: closure.compiled = Compiled
-    V->>HC: 第4次起调用 Compiled（JVM 方法）
-    HC->>HC: C2 编译成机器码（提速）
-```
+## 6. JitBridge：生成代码的静态桥
 
-## 3. 保守策略：canCompile
+`JitBridge`（`JitBridge.kt:13`）是一组 `static` 小方法，被生成代码用 `INVOKESTATIC` 调用：
 
-不是所有字节码都能/都值得 JIT。`canCompile(bc)` 做白名单检查：
+- 类型转换/运算：`toD/toBool/add/sub/mul/div/mod/lt/le/gt/ge/eq/seq/...`（全部委托给 `JsValues`，
+  与 VM/Walker 同语义）。
+- `loadProp/loadPropGeneric`：属性查找 + 复用 `PropIc`（见 §4）。
+- `loadGlobal`：全局绑定查找，语义等同 `Op.LOAD_GLOBAL`（缺失且不容忍则 `ReferenceError`）。
+- `invokeCall/invokeCall2/argsOfN`：函数调用桥（见 §4）。
 
-```kotlin
-60:90:engine/src/main/kotlin/io/kjs/vm/Jit.kt
-fun canCompile(bc: Bytecode): Boolean {
-    if (bc.functions.isNotEmpty()) return false  // 含嵌套闭包先不编（简化）
-    if (bc.usesWith || bc.usesEval) return false // with/eval 破坏静态分析
-    if (bc.hasTryFinally) return false            // finally 控制流复杂，先不编
-    for (i in 0 until bc.countA) {
-        val op = Opcode.fromOrdinal(bc.codeA[i])
-        if (op in UNSUPPORTED) return false        // 不支持的 opcode
-    }
-    return true
-}
-```
+这些方法小而单态，HotSpot C2 会内联进生成代码，使"桥接"开销消失。
 
-> 保守主义是对的：JIT 错了就是崩溃或正确性问题，宁可回退解释器。随着实现成熟可逐步放开。
+## 7. 设计取舍
 
-## 4. 类型特化：inferDoubleLocals
+- **模板 JIT 而非方法 JIT**：KJS 无寄存器/SSA，直接"字节码 → JVM 字节码"，实现简单、可借力 JVM 后端。
+- **类型特化是性能关键**：不特化也能跑，但热点数值循环会反复装箱；特化后零装箱、可落 XMM。
+- **受支持子集 + 整体拒绝**：不支持的 opcode 让函数留在解释器，正确性永远优先于性能。
+- **异步 + volatile 发布**：编译不阻塞执行；下一次调用即享受 JIT，无需全局锁。
+- **VM/JIT 共享 IC 与 `JsValues`**：一份缓存、同一套语义，保证二者行为一致且 JIT 可被内联。
+- **特化失败回退**：`JitAbort`/`VerifyError` 自动降级全装箱，鲁棒性优先。
 
-最大收益来自**类型特化**。JS 值都是 `Any?`，但热循环里局部变量往往是纯数字。
-`inferDoubleLocals` 用抽象解释（abstract interpretation）推断哪些局部槽**永远只装 double**：
+## 8. 常见坑
 
-```kotlin
-100:140:engine/src/main/kotlin/io/kjs/vm/Jit.kt
-// 抽象解释：模拟每条指令对栈/局部变量类型的影响
-// 状态: 每个局部槽 ∈ {ANY, DOUBLE, BOOL, UNDEF}
-fun inferDoubleLocals(bc: Bytecode): BooleanArray {
-    val localT = BooleanArray(bc.localsSize) { false }  // true = 确定是 double
-    val stackT = ArrayDeque<Type>()
-    for (i in 0 until bc.countA) {
-        val op = Opcode.fromOrdinal(bc.codeA[i])
-        when (op) {
-            Opcode.LOAD_CONST -> if (bc.constants[bc.aOpsA[i]] is Double) stackT += DOUBLE
-            Opcode.DADD -> { pop2Double(stackT); stackT += DOUBLE }  // 已知 double 相加
-            Opcode.ADD -> {
-                // 若两操作数都是 DOUBLE，特化为数值加，否则 ANY（拼接/对象）
-                val r = stackT.removeLast(); val l = stackT.removeLast()
-                stackT += if (l==DOUBLE && r==DOUBLE) DOUBLE else ANY
-            }
-            Opcode.STORE_LOCAL -> { if (stackT.last()==DOUBLE) localT[bc.aOpsA[i]]=true }
-        }
-    }
-    return localT
-}
-```
-
-推断结果驱动代码生成：被标记为 double 的局部槽在生成的 JVM 方法里用原生 `double` 局部变量，
-**彻底避免装箱**（`Double` ↔ `double` 拆箱开销）。`sumN(1M)` 因此从 ~403ms 降到 ~10ms。
-
-## 5. 栈类型追踪
-
-生成的 JVM 方法用一个 `Array<Any?>` 操作数栈（与解释器同构），但每条指令生成时都带上
-栈类型信息（ANY/DOUBLE/BOOL），决定用：
-
-- `DADD` / `DMUL` / `DCMPL`：原生双精度加减与比较（快，无装箱）；
-- 通用 `ADD`：走 `looseAdd`（需类型强制，慢但正确）。
-
-```kotlin
-142:170:engine/src/main/kotlin/io/kjs/vm/Jit.kt
-// 生成 VM ADD 时：
-if (leftType == DOUBLE && rightType == DOUBLE) {
-    mv.visitInsn(DADD)                       // 原生双精度
-} else {
-    mv.visitMethodInsn(INVOKESTATIC, "JsValue", "looseAdd", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;")
-}
-```
-
-## 6. ASM 生成 JVM 字节码
-
-`Compiled`（`vm/Compiled.kt:1`）是 `JsFunction` 的子类，由 ASM 动态生成 `invoke` 体：
-
-```kotlin
-1:45:engine/src/main/kotlin/io/kjs/vm/Compiled.kt
-abstract class Compiled : JsFunction() {
-    // ASM 生成的子类重写 call()，把字节码翻译成一连串 JVM 指令
-    // 与原 Vm 主循环语义等价，只是：
-    //   - 操作数栈是原生 JVM 栈（不再是 Array 索引）
-    //   - double 槽用原生 double
-    //   - 属性访问内联 PropIc 命中分支
-}
-```
-
-生成流程：遍历 `codeA/aOpsA/bOpsA` → 对每条 opcode `emit` 对应 JVM 指令。关键映射：
-
-| Bytecode | 生成的 JVM 指令 |
-|----------|----------------|
-| `LOAD_LOCAL a` | `aload` / `dload`（若该槽是 double） |
-| `STORE_LOCAL a` | `astore` / `dstore` |
-| `LOAD_CONST a` | `ldc` 常量 |
-| `DADD` | `dadd` |
-| `LOAD_PROP a` | `aload obj; if(shape==cached) getfield else call getProperty` |
-| `CALL a b` | `invoke` JsClosure.call / JsNativeFn.fn |
-| `RETURN` | `areturn` / `dreturn` |
-
-`JitBridge`（`vm/JitBridge.kt`）把 `Bytecode` + 推断结果喂给 ASM 的 `ClassWriter`，
-`defineClass` 加载，实例化 `Compiled` 子类，挂回 `closure.compiled`。
-
-## 7. 与 VM 语义对齐（正确性）
-
-JIT 生成的代码**必须与 Vm 解释器逐指令等价**，否则就是 JIT bug。`Tracer`（`Engine.kt`）+ D9 的
-VM/Walker 对拍用来兜住这条线。任何 opcode 的 JIT 实现都以 Vm 对应 `when` 分支为准。
-
-## 8. 调试开关
-
-- `KJS_JIT=0`：禁用 JIT，纯解释器（便于对照性能/正确性）。
-- `KJS_JIT_TRACE=1`：打印每次编译的函数名、是否特化、生成的字节码大小。
-- `KJS_JIT_DUMP=<dir>`：把生成的 `.class` 落盘，可用 `javap -c` 反汇编检查。
-
-## 9. 设计取舍
-
-- **模板 JIT 而非 tracing JIT**：整函数编译比 trace 简单、可控，且不依赖运行时 trace 收集。
-- **异步编译 + 原子替换**：不阻塞主执行流；未编完前解释器顶上，平滑过渡。
-- **保守 canCompile**：宁可不编也不出错；随着成熟逐步放开闭包/finally。
-- **白嫖 C2**：省去自写寄存器分配/内联，专注"字节码→JVM 字节码"这一层。
-
-## 10. 常见坑
-
-- **类型推断过宽**：某槽曾被赋非 double（如第一次循环 `i` 从 `undefined` 来），推断退化为 ANY，
-  特化失效 → 性能回退但**正确**。这是保守推断的安全副作用。
-- **IC 缓存失效未同步**：JIT 内联了 IC 命中分支，但对象的形状变化了，生成的代码必须包含
-  "形状不符 → 跳回慢路径 `getProperty`" 的判断，否则读到错值。
-- **与 finally/异常的交互**：含 `try/finally` 的函数暂不编译（`canCompile` 拦掉），因为 JVM 异常
-  表生成复杂，易错。
-- **闭包捕获**：含嵌套闭包的函数暂不编译（upvalue 绑定在生成期难对齐），留待后续。
-- **`defineClass` 的 ClassLoader**：生成的类必须用与引擎同级的 `ClassLoader` 定义，否则
-  `Compiled` 类型转换/权限失败。
+- **`double` 在栈中坑位**：`double` 占 2 个 JVM 槽，`SWAP` 不能跨 cat2/cat1 直接交换，`boxTopTwo`/
+  `boxAllStack` 在"double 埋在 ANY 之下"时直接抛 `JitAbort` 回退（D5/JIT 的保守正确性策略）。
+- **抽象栈与 JVM 栈必须同步**：`emitBody` 的 `aStack` 与生成的 JVM 指令栈要逐条对应；一处不同步
+  → JVM `VerifyError` → 回退非特化（甚至编译失败）。
+- **分支目标重置**：`JMP/JT/JF` 目标处必须假设抽象栈全 `ANY`；遗漏重置会让特化路径误用错误类型。
+- **`argc > 4` 的 CALL 不能 JIT**：超过 4 实参的函数被 `canCompile` 拒绝，整体走解释器。
+- **IC 共享的线程安全**：`bc.caches[pc]` 被 VM/JIT 共享（单线程安全）；未来多线程执行需加锁。
+- **常量池字段初始化时机**：`CONSTS/STRINGS` 必须在 `newInstance` 前写 `static` 字段，否则 `LOAD_CONST`
+  读到 `null`。

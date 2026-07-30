@@ -1,147 +1,163 @@
-# D7 · 内联缓存（PropIc / GlobalIc）
+# D7 · 内联缓存 Inline Cache
 
-> 前置知识：D5、D6。本篇讲"快的关键之一"：用缓存把昂贵的查找变成 O(1) 命中。
+> 前置知识：D5（VM）、D6（值模型）。
+>
+> 本篇拆解 `vm/PropIc.kt` 与 `vm/GlobalIc.kt`：VM 如何用**每指令一个缓存槽**记录"上次成功查找的
+> 形状/拥有者"，把属性访问与原型链查找从 O(链长) 降为 O(1)。这是 VM 性能内核之一。
 
-## 1. 为什么需要 IC
+## 1. 为什么需要内联缓存
 
-看这两行：
+`LOAD_PROP obj.x` 的慢路径（`propGet`，D5 §10）要沿 `obj` 的原型链逐层 `hasOwnProperty` 查找，
+对象越深越慢。但现实里**同一处属性访问的接收者形状往往稳定**（如循环里反复读 `arr.length`，
+`arr` 始终是 `JsArray`）。内联缓存（IC）就是："记住上次这次访问的形状和命中点，下次先快查，
+命中就跳过原型链"。
 
-```js
-for (let i = 0; i < 1e6; i++) sum += obj.x;   // obj.x 每次都查？
-```
+KJS 的 IC 是**每字节码 PC 一个槽**（`bc.caches[pc]`，D5 §10），即每条 `LOAD_PROP` 指令独立缓存，
+互不干扰。
 
-若每次 `obj.x` 都沿原型链 `getProperty`（D6 §2），就是 100 万次 `HashMap` 查找 + 可能的链爬，
-极慢。但**绝大多数情况下对象的"形状"不变**（同一类实例、同一组 own 键），
-`x` 的存储位置是固定的。IC 就是"记住上次的位置，下次先核对形状，形状没变就直接用"。
+## 2. PropIc：属性访问的单态缓存
 
-## 2. 单态 IC 原理
-
-单态（monomorphic）IC：只缓存**一种**对象形状。命中条件 = "当前对象的隐藏类/proto 与缓存的相同"：
-
-```mermaid
-flowchart TD
-    L[LOAD_PROP ic] --> C{shape 命中?}
-    C -->|是| H[直接返回缓存值/偏移]
-    C -->|否| S[慢路径: 沿原型链 getProperty]
-    S --> U[更新 IC: 记录新 shape→位置]
-    U --> R[返回]
-```
-
-"形状（shape）"在 KJS 里用对象的 `proto` + own 键集合（或更精确地，用一个 shape id）刻画。
-`PropIc`（`vm/PropIc.kt:1`）：
+`PropIc`（`PropIc.kt:14`）是单态（monomorphic）IC，记录"某接收者类名 + 属性名 → 命中的 owner"：
 
 ```kotlin
-1:35:engine/src/main/kotlin/io/kjs/vm/PropIc.kt
+14:40:engine/src/main/kotlin/io/kjs/vm/PropIc.kt
 class PropIc {
-    var cachedShape: Any? = null    // 上次对象的形状标识（proto/shape id）
-    var cachedSlot: Int = -1        // own 里的偏移/槽
-    var cachedValue: Any? = null    // 对无 getter 的数据属性，可直接缓存值引用
-    var polymorphic: Boolean = false
+    private var cachedClass: String? = null       // 上次接收者的 className(形状键)
+    private var cachedOwner: JsObject? = null      // 上次属性实际所在的原型层
+    private var cachedValue: Any? = null
+    private var cachedName: String? = null
+    private var hits = 0; private var misses = 0
+    private var megamorphic = false
 
-    fun load(obj: Any?, key: String, realm: Realm): Any? {
-        val shape = shapeOf(obj)            // 取形状
-        if (shape == cachedShape && !polymorphic) {
-            return if (cachedSlot >= 0) (obj as JsObject).ownValueAt(cachedSlot)
-                   else cachedValue
+    fun get(obj: JsObject?, name: String, slow: (JsObject?, String) -> Any?): Any? {
+        if (obj == null) return slow(obj, name)
+        if (!megamorphic) {
+            val cls = obj.className
+            if (cls == cachedClass && name == cachedName) {
+                val owner = cachedOwner
+                if (owner != null && owner.hasOwn(name)) {
+                    var p: JsObject? = obj
+                    // 校验 cachedOwner 仍是 obj 原型链上的祖先; 仍是则命中
+                    while (p != null) { if (p === owner) { hits++; return owner.getOwn(name) }; p = p.proto }
+                }
+            }
         }
-        // 慢路径
-        val v = getProperty(obj, key, realm)
-        // 单态更新
-        if (!polymorphic) {
-            cachedShape = shape
-            cachedValue = v
-        }
+        val v = slow(obj, name)              // 未命中 → 慢路径
+        if (!megamorphic) fillOrInvalidate(obj, name)
         return v
     }
 }
 ```
 
-> 对**数据属性**（无 getter），连 `ownValueAt` 都省了——直接缓存 `cachedValue` 的引用（对象本身
-> 不变即可复用）。getter/可写属性则缓存槽偏移。
+命中条件有三道关：`cls == cachedClass`（形状没变）、`name == cachedName`（属性没变）、且
+`cachedOwner` 仍然是 `obj` 原型链的祖先（`PropIc.kt:29` 的 `while` 校验）。只有三者全满足才直接
+返回 `owner.getOwn(name)`，**完全跳过原型链**。
 
-## 3. 多态与 megamorphic 回退
+> **`className` 即"形状键"**：KJS 没有完整 HiddenClass，用构造函数名近似形状。同名不同结构对象可能
+> 同 `className`，所以加了 `cachedOwner.hasOwn(name)` 二次校验（D6 §6 提到的局限与兜底）。
 
-当同一 IC 槽遇到**不同形状**的对象（典型的 `if (cond) a.x else b.x`，a、b 形状不同），
-继续缓存单一形状会一直 miss。KJS 的处理：
+### 2.1 未命中时的播种与失效
 
-- **多态（polymorphic）**：IC 升级为一个小的**形状→位置映射表**（2~4 项），线性查表命中即用。
-- **megamorphic**：形状超过阈值（通常 >4），放弃特化，`polymorphic=true` 标志让 `load` 永远走
-  慢路径 `getProperty`，不再尝试缓存——避免表无限膨胀。此时性能退化为无 IC，但正确。
+`fillOrInvalidate`（`PropIc.kt:42`）沿原型链找到真正 owner，然后：
+
+- 若还没缓存过（`cachedClass == null`）：记下 `className/owner/name`，成为单态。
+- 若已缓存但**形状或属性变了**（`className != cachedClass || name != cachedName`）：计入 `misses`；
+  若 `misses > 10` 标记 `megamorphic`（完全放弃缓存，永远走慢路径），否则**重新播种**（reseeded）
+  到新形状。
 
 ```kotlin
-37:60:engine/src/main/kotlin/io/kjs/vm/PropIc.kt
-fun loadSlow(obj: Any?, key: String, realm: Realm): Any? {
-    val v = getProperty(obj, key, realm)
-    if (!polymorphic) {
-        if (cachedShape == null) { cachedShape = shapeOf(obj); cachedValue = v }
-        else if (cachedShape != shapeOf(obj)) {
-            polymorphic = true           // 升为 megamorphic，后续只走慢路径
-        }
+42:56:engine/src/main/kotlin/io/kjs/vm/PropIc.kt
+private fun fillOrInvalidate(obj: JsObject, name: String) {
+    var p: JsObject? = obj
+    while (p != null) { if (p.hasOwn(name)) break; p = p.proto }
+    if (p == null) { misses++; if (misses > 10) megamorphic = true; return }
+    if (cachedClass == null) { /* 首次 → 播种 */ cachedClass = obj.className; cachedOwner = p; cachedName = name; cachedValue = p.getOwn(name); return }
+    if (cachedClass != obj.className || cachedName != name) {
+        misses++
+        if (misses > 10) { megamorphic = true; return }
+        cachedClass = obj.className; cachedOwner = p; cachedName = name; cachedValue = p.getOwn(name)  // 重新播种
     }
-    return v
 }
 ```
 
-## 4. STORE_PROP 的 IC
+### 2.2 与 VM/JIT 的关系
 
-写属性同样用形状缓存：`STORE_PROP a` 的 IC 命中时，直接在 own 的同一槽 `setProperty`，
-跳过 `writable` 重判（除非形状变了需重新查）。对 `obj.x = 1` 在热循环里被反复执行，收益显著。
+- **VM 端**：`LOAD_PROP` 惰性建 `PropIc` 放 `bc.caches[pc]`（`D5 §10` 的 `ic.get(obj, name){...}`）。
+- **JIT 端**：`JitBridge.loadProp`（`JitBridge.kt:98`）**复用同一个 `bc.caches[pc]` 的 `PropIc`**，
+  因为编译产物与原 `Bytecode` 共享对象。JIT 生成的代码调 `loadProp` 时仍走同一个单态缓存，HotSpot
+  能把这次调用内联，单态站点几乎零开销（`Jit.kt` 注释强调 IC "highly inline-friendly"）。
 
-## 5. LOAD_GLOBAL 的 IC（GlobalIc）
+```mermaid
+flowchart TD
+    LOAD["LOAD_PROP x @pc"] --> IC{caches[pc] 存在?}
+    IC -->|否| NEW["new PropIc 放 caches[pc]"]
+    IC -->|是| HIT{className/name 不变 且 owner 仍在链上?}
+    NEW --> SLOW
+    HIT -->|是| FAST["直接 owner.getOwn(name) O(1)"]
+    HIT -->|否| SLOW["propGet 走原型链"]
+    SLOW --> FILL["fillOrInvalidate: 播种/重播; miss 过多→megamorphic"]
+```
 
-全局变量查找要沿 `Env` 链从 `globalEnv` 往上找"谁拥有这个名字"（D6 §5）。
-`GlobalIc`（`vm/GlobalIc.kt:1`）缓存"名字 → 拥有者 Env"：
+## 3. GlobalIc：全局变量访问的缓存
+
+`LOAD_GLOBAL` 的慢路径要沿 `Environment` 父链找拥有者（D6 §5）。`GlobalIc`（`GlobalIc.kt:26`）
+针对"每条全局访问站点"缓存**拥有该名的 `Environment` 本身**（而非值）：
 
 ```kotlin
-1:40:engine/src/main/kotlin/io/kjs/vm/GlobalIc.kt
+26:53:engine/src/main/kotlin/io/kjs/vm/GlobalIc.kt
 class GlobalIc {
-    var cachedName: String? = null
-    var cachedOwner: Env? = null      // 命中后直接在这个 Env 上读写
-    var cachedSlot: Int = -1          // 若该 Env 用槽表示
+    @JvmField var cachedStart: Environment? = null   // 起始查找环境(常为 closureEnv)
+    @JvmField var cachedOwner: Environment? = null    // 实际拥有该绑定的环境
+    @JvmField var cachedName: String? = null
 
-    fun resolve(name: String, start: Env): Env {
-        if (name == cachedName && start.ownsSlot(cachedSlot)) {
-            return cachedOwner        // 命中：跳过链爬
-        }
-        val owner = start.resolveOwner(name)   // 慢路径：沿链找拥有者
-        cachedName = name
-        cachedOwner = owner
-        cachedSlot = owner.slotOf(name)
+    fun get(start: Environment, name: String): Any? {
+        val owner = if (cachedStart === start && cachedName === name) cachedOwner
+                    else resolveAndFill(start, name)             // 失效则重解
+        if (owner == null) return SENTINEL_MISSING
+        return owner.vars[name]                                // 一次 HashMap.get
+    }
+    private fun resolveAndFill(start: Environment, name: String): Environment? {
+        val owner = start.resolveOwner(name)                    // 沿 Environment 父链找拥有者
+        cachedStart = start; cachedName = name; cachedOwner = owner
         return owner
     }
 }
 ```
 
-**`resolveOwner` 的慢路径**：从 `start`（`globalEnv`）沿 `parent` 链向上，对每个 `Env` 查它是否
-持有 `name`。对 `g.x`（全局函数里反复访问外层 `var`）每次都链爬，IC 把它变成一次比较。
+要点：
 
-> 这是上次改动的重点（`GlobalIc.kt` 是本次工作区新增文件，配合 `IntrinsicsExt` 调优全局查找）。
+- **验证键是 `(start 环境, name)`**（`GlobalIc.kt:36`）：只有"从同一环境、查同一名字"才命中缓存的
+  owner。新 `closureEnv` 或名字被遮蔽（shadow）→ 失效重解。
+- **缓存"拥有者 map"而非值**（`GlobalIc.kt:18` 注释）：`owner.vars[name]` 每次都是一次 `HashMap.get`，
+  所以 `=` 之后的新值**立即可见**，无需失效。这是与 PropIc 相对的设计选择（PropIc 缓存值是因为
+  getter 不一定纯）。
+- **`SENTINEL_MISSING`**：用专属对象区分"缓存说没找到"与"值是 JVM `null`"，避免把缺失误判成 `null`
+  值（`GlobalIc.kt:52`）。
+- **`tolerate` 语义**：缺失且 `tolerate != 0` 仍返回 `undefined`；否则由调用方抛 `ReferenceError`
+  （D5 §11）。慢路径 `resolveOwner` 由 `Environment.resolveOwner` 提供（D6 §5）。
 
-## 6. IC 与编译期的契约
+> 热点：`for` 循环里反复读全局函数（如 `Math.sqrt`）几乎总是单态——`closureEnv` 不变、名字不改，
+> 每次直接 `owner.vars[name]`，零链遍历。
 
-回忆 D3：字节码里 `LOAD_PROP a` 的 `a` 是 **IC 槽下标**，编译期通过 `bc.addPropCache()` 预分配；
-`LOAD_GLOBAL b` 的 `b` 是名字池下标，`GlobalIc` 实例挂在 `Bytecode` 或 `Frame` 上、按名字索引。
-VM 执行时直接取 `bc.caches[a].load(...)`。两者解耦：编译器只管"留个槽"，VM 管"填缓存"。
+## 4. 设计取舍
 
-## 7. IC 与 JIT 的协同
+- **每 PC 一个 IC 槽**：指令间互不污染，单态/多态按站点独立判断；代价是 `caches` 数组按字节码长度
+  分配（惰性创建，无属性访问的函数不分配，D5 §10）。
+- **className 当形状键**：轻量；配合 owner 链校验兜底同名异结构对象。
+- **PropIc 缓存值、GlobalIc 缓存 map**：取决于 getter 是否纯——属性 getter 可能含副作用，故
+  缓存 owner 后仍需重算；全局变量是普通槽，故缓存 map。
+- **megamorphic 退化**：多态过多直接弃缓存放慢路径，避免"缓存抖动"反而更慢。
+- **VM/JIT 共用同一 `bc.caches`**：一份 IC 两后端受益，JIT 还能被 HotSpot 内联。
 
-D8 的模板 JIT 会**直接内联** IC 的命中分支：生成一个 `if (obj.shape == cachedShape) return slot`
-的 JVM 原生比较，连 `PropIc.load` 的方法调用都省了。IC 槽在 JIT 编译时已固定，于是类型稳定的
-属性访问退化成"一次引用比较 + 一次字段读"。
+## 5. 常见坑
 
-## 8. 设计取舍
-
-- **单态优先，多态兜底，megamorphic 退场**：不追求缓存所有形状，超阈值就放弃，省内存保稳定。
-- **用形状而非类型**：同一 `class` 的不同实例形状相同 → 一次缓存惠及所有实例，命中率高。
-- **GlobalIc 缓存拥有者而非值**：全局变量值会变，但"谁拥有它"基本不变；缓存位置即可。
-
-## 9. 常见坑
-
-- **形状被改动但 IC 未失效**：若某操作意外改变了对象的 own 键集（如首次写新属性），
-  形状 id 变化，IC 自然 miss 走慢路径——**正确**，只是暂时变慢，下次重新缓存。
-- **跨 Realm 的形状不兼容**：两个 `Realm` 的原型对象即使结构相同也不是同一 shape；
-  IC 按对象引用/shape id 判等，天然隔离。
-- **getter 不能缓存值**：有 `get` 陷阱的属性每次都得调 getter，只能缓存"槽"不能缓存"值"，
-  `PropIc` 用 `cachedSlot>=0` 区分这两种缓存策略。
-- **IC 槽与字节码绑定**：IC 是**每函数每槽**的，不能跨函数共享；`makeClosure` 复制字节码时
-  也要注意 IC 状态是否需要重置（mega 状态保留可加速，单态状态应保留因形状可能复用）。
+- **形状键精度**：仅 `className` 不足以区分所有结构；依赖 `cachedOwner.hasOwn(name)` 兜底，否则
+  可能返回错误值（尤其代理对象/proto 动态修改）。
+- **`megamorphic` 不可恢复**：一旦 `misses > 10` 永久退化为慢路径；写微基准时若混用多形状输入会
+  触发，导致"测不准"热点性能。
+- **owner 链校验缺失**：忘记 `while (p === owner)` 校验会缓存"曾经命中但已被改 proto"的 owner，
+  返回过期值。
+- **`SENTINEL_MISSING` 泄漏**：GlobalIc 的 `SENTINEL_MISSING` 绝不能当正常值返回给 JS 层，必须
+  在调用方转成 `undefined` 或抛错。
+- **IC 槽生命周期**：`caches` 挂在 `Bytecode` 上，多个 `Frame` 并发执行同一函数**共享同一 IC**（本
+  VM 单线程，未加锁）；若未来多线程执行需考虑并发安全。

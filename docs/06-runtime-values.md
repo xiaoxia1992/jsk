@@ -1,202 +1,192 @@
-# D6 · 运行时值模型
+# D6 · 运行时值模型 Runtime Values
 
-> 前置知识：D3、D5。本篇讲"栈上那一堆 `Any?` 到底是什么"，以及 JS 语义如何在 JVM 类型上落地。
+> 前置知识：D0（总览）、D5（VM）。
+>
+> 本篇拆解 `runtime/` 下的 `JsValue`/`JsObject`/`Realm`/`JsFunction`/Environment：KJS 用什么表示
+> JS 的"值"，原型链如何实现，以及类型强制如何集中处理。它是 VM 与 Walker 两个后端共享的地基。
 
-## 1. 装箱表示：用 `Any?` 装一切
+## 1. 统一装箱：一切皆 `Any?`
 
-KJS 用 JVM 的 `Any?` 统一表示 JS 值，按类型直接映射：
+KJS（M1）不做 NaN-boxing，而是用 Kotlin 的 `Any?` 直接承载所有 JS 值，靠"类型即标签"区分：
 
-| JS 类型 | KJS 表示（JVM） | 说明 |
-|---------|----------------|------|
-| Undefined | `Undefined` 单例对象 | 哨兵，非 `null`（见下） |
-| Null | `null` | JVM 原生 `null` |
-| Boolean | `Boolean` | JVM 原生 |
-| Number | `Double` | 所有数字都是双精度（含整数） |
-| BigInt | `BigInteger` | `kotlinx`/`java.math` |
-| String | `String` | JVM 原生 |
-| Symbol | `JsSymbol` | 含 `description`，去重 |
-| Object | `JsObject` 及其子类 | 见下 |
-| Function | `JsClosure` / `JsNativeFn` / `JsBoundFn` | 见下 |
-| Array | `JsArray`（`JsObject` 子类） | 带 `length` |
-| Proxy | `JsProxy` | 转发陷阱 |
+| Kotlin 类型 | 表示的 JS 值 | 说明 |
+|---|---|---|
+| `Double` | `number` | 所有数字统一为双精度（含整数） |
+| `BigInteger` | `bigint` | `123n` 字面量 |
+| `String` | `string` | |
+| `Boolean` | `boolean` | |
+| `null` | `null` | `JsValues.NULL` 就是 `null` 本身 |
+| `Undefined`（单例对象） | `undefined` | `JsValues.UNDEFINED`，不是 `null` |
+| `JsObject` | 对象 / 数组 | 含原型链 |
+| `JsFunction`（继承 `JsObject`） | 函数 | `typeof` 为 `"function"` |
 
-关键设计：**Undefined 用独立的 `Undefined` 单例**，而不是用 `null`。这样才能区分
-`undefined` 与 `null`——JS 里 `undefined === null` 是 `false`，但 `undefined == null` 是 `true`
-（这是 `looseEq` 的特殊分支）。KJS 在 `JsValue.kt` 定义：
+`Undefined` 用一个**哨兵单例对象**（`JsValue.kt:9`）而不是 `null`，这样 `undefined` 与 `null` 能
+并存且区分（`null` 就是 JVM `null`）。`JsObject` 与 `JsFunction` 也走 `Any?`，于是属性、数组元素、
+栈上值、返回值全都是同一个 `Any?` 类型——VM 的 `stack: Array<Any?>` 与此一致（D5 §2）。
 
 ```kotlin
-10:30:engine/src/main/kotlin/io/kjs/runtime/JsValue.kt
-object Undefined                          // 单例哨兵
-val NULL = Undefined                       // 别名（栈上常用）
-// 类型判定工具
-fun isUndefined(v: Any?) = v === Undefined
-fun isNull(v: Any?) = v == null
-fun isCallable(v: Any?) = v is JsFunction
-fun typeOf(v: Any?): String = when {     // JS typeof
-    isUndefined(v) -> "undefined"
-    v == null -> "object"               // null 的 typeof 是 "object"（JS 历史坑）
-    v is Boolean -> "boolean"
-    v is Double -> "number"
-    v is BigInteger -> "bigint"
-    v is String -> "string"
-    v is JsSymbol -> "symbol"
-    v is JsFunction -> "function"
-    else -> "object"
+9:13:engine/src/main/kotlin/io/kjs/runtime/JsValue.kt
+object Undefined { override fun toString() = "undefined" }
+object JsValues {
+    val UNDEFINED: Any? = Undefined
+    val NULL: Any? = null
+```
+
+## 2. JsValues：集中式类型强制（"oracle"）
+
+所有 `toBool/toNumber/toStr/looseEq/strictEq` 都收口在 `JsValues`（`JsValue.kt:11`），VM 与 Walker
+共享同一套语义，保证两个后端结果一致（D9）。
+
+- **`toNumber`**（`JsValue.kt:42`）：`undefined→NaN`、`null→0`、布尔→`1/0`、字符串 `trim` 后解析、
+  `JsObject` 走 `defaultValue("number")`。这是 JS `+`、比较、位运算的统一入口。
+- **`toInt32/toUint32`**（`JsValue.kt:59`）：位运算的 `ToInt32` 抽象操作，`toUint32` 用 `and 0xFFFFFFFFL`
+  得到无符号 32 位（`>>>` 用）。
+- **`toStr`**（`JsValue.kt:70`）：数字经 `numberToString`（NaN/Inf/-0/整数特例，避免 `1.0`→`"1.0"`）。
+- **`looseEq`（==）**（`JsValue.kt:92`）：先 `sameType` 走 `strictEq`；`null`/`undefined` 互等；
+  数字×字符串→数字比；布尔→数字；对象×原始→拆箱比。这是 JS 最复杂的抽象相等算法。
+- **`strictEq`（===）**（`JsValue.kt:104`）：同类型才相等；`Double.NaN` 与自身不等（`NaN !== NaN` 语义）。
+
+> 把强制集中在一处，是"双后端对拍"能成立的前提——VM 的 `ADD`/比较与 Walker 的 `evalBinary` 都调
+> 同一个 `JsValues`，自然一致。
+
+## 3. JsObject：属性表 + 原型链
+
+`JsObject`（`JsObject.kt:12`）是最小可用的 JS 对象：
+
+```kotlin
+12:40:engine/src/main/kotlin/io/kjs/runtime/JsObject.kt
+open class JsObject(var proto: JsObject? = null) {
+    val properties: LinkedHashMap<String, Any?> = LinkedHashMap()   // 自有属性, 保序
+    var callable: JsFunction? = null                                // 是否为可调用(函数)
+    var className: String = "Object"
+    var extensible: Boolean = true
+
+    open fun get(key: String): Any? {                                // 自有 + 原型链查找
+        var o: JsObject? = this
+        while (o != null) {
+            if (o.properties.containsKey(key)) return o.properties[key]
+            o = o.proto
+        }
+        return JsValues.UNDEFINED
+    }
+    open fun set(key: String, value: Any?) { properties[key] = value }
+    // has / hasOwn / delete / keys 同构
 }
 ```
 
-## 2. JsObject 与原型链
+核心机制：**`get` 沿 `proto` 链向上委托**（`JsObject.kt:21`）；`set` 只写自有表（不向上赋值，
+符合 JS 默认语义）；`className` 用构造函数名充当"shape 标记"——这正是内联缓存（D7）判定
+单态的形状键。`defaultValue`（`JsObject.kt:45`）实现 `ToPrimitive`：按 hint 顺序调 `valueOf`/
+`toString`，否则返回 `"[object ClassName]"`。
 
-`JsObject`（`runtime/JsObject.kt:20`）持有：
+### 3.1 特化子类型
 
-```kotlin
-20:60:engine/src/main/kotlin/io/kjs/runtime/JsObject.kt
-open class JsObject(
-    var proto: JsObject?,                 // 原型（链尾是 null）
-    val clazz: String = "Object",
-) {
-    val own = LinkedHashMap<String, Property>()   // own 属性
-    var extensible = true
-    // hidden shape / IC 友好：属性槽可缓存
-}
-data class Property(var value: Any?, var get: (()->Any?)?, var set: ((Any?)->Unit)?,
-                    var writable: Boolean, var enumerable: Boolean, var configurable: Boolean)
-```
+- **`JsArray`**（`JsObject.kt:108`）：仅比 `JsObject` 多一个 `length`（写入下标 `>= length` 时自动
+  扩长，D5 §11 的 `propSet` 也维护它）。索引存为字符串键（如 `"0"`），与对象共用 `get/set`。
+- **`JsTypedArray`**（`JsObject.kt:128`）：在 `ByteArray` 上叠加 `get/set` 覆盖，把 `arr[i]` 路由到
+  字节缓冲的强类型读写（`Int8`…`Float64`），VM 的 `LOAD_ELEM/STORE_ELEM` 透过 `get/set` 自动看到正确值。
+- **`JsProxy`**（`JsObject.kt:68`）：拦截 `get/set/has/deleteProperty/ownKeys` 转发到 handler 的
+  trap，未定义 trap 则 `target` 原样处理。这是 ES Proxy 的子集实现。
 
-属性查找 `getProperty(obj, key)`（`JsObject.kt:80`）走原型链：
+## 4. Realm：一次执行会话的全部全局状态
 
-```mermaid
-flowchart TD
-    Q[getProperty obj,key] --> O{obj.own 有 key?}
-    O -->|是| R[返回值]
-    O -->|否| P{obj.proto != null?}
-    P -->|是| Q2[getProperty obj.proto,key]
-    Q2 --> R
-    P -->|否| U[返回 Undefined]
-```
-
-`OwnProperty` 直接读 `own`；继承属性沿 `proto` 向上爬。写属性 `setProperty`：若 own 已有且
-`writable=false` → 严格模式报错；否则在 own 上建/改。**不会**沿原型链改父对象属性——这正是
-`obj.x = 1` 不会污染原型 `x` 的原因。
-
-### 隐藏类 / IC 友好
-
-`Property` 存在 `LinkedHashMap`，但 `PropIc`（D7）会缓存"对象的形状（proto + own 键集合）到
-属性偏移"的映射，命中时跳过 `HashMap` 查找。JIT（D8）进一步把"形状稳定"的对象属性直接当
-`double/Any?` 字段访问。
-
-## 3. JsArray / JsTypedArray / JsProxy
-
-- **`JsArray`**（`JsObject` 子类）：`length` 作为特殊属性维护，索引 `0..n-1` 存 `own`。
-  `push/pop/map/forEach` 等由 `Intrinsics`（D10）实现。
-- **`JsTypedArray`**：`Int8Array` 等，底层 `ByteArray`/`IntArray`，与 JS 语义对齐（`set`/`subarray`）。
-- **`JsProxy`**：持有 `target` + `handler`，所有 `get/set/has/apply` 转发到 handler 陷阱，
-  `CALL` 时识别 `JsProxy` 走 `apply` 陷阱。
-
-## 4. 函数对象（JsFunction.kt）
-
-`JsFunction`（`runtime/JsFunction.kt:1`）是函数基类，三个实现：
+`Realm`（`Realm.kt:7`）把所有内置原型、全局对象、全局环境打包，便于创建互相隔离的引擎实例：
 
 ```kotlin
-1:40:engine/src/main/kotlin/io/kjs/runtime/JsFunction.kt
-sealed class JsFunction : JsObject() {
-    abstract fun arity(): Int
-    abstract fun call(vm: Vm, args: List<Any?>, thisVal: Any?): Any?
-}
-class JsClosure(                       // 用户写的 JS 函数
-    val bc: Bytecode, val upvals: Array<Upvalue?>,
-    val name: String?, val env: Env,
-) : JsFunction()
-class JsNativeFn(                      // 宿主/Kotlin 实现的内置函数
-    val name: String, val fn: (Vm, List<Any?>, Any?) -> Any?,
-) : JsFunction()
-class JsBoundFn(val target: JsFunction, val boundThis: Any?, val boundArgs: List<Any?>)
-    : JsFunction()
-```
-
-- **`JsClosure`**：持编译后的 `Bytecode`、闭包 `upvals`、定义时作用域 `env`。`call` 委托给
-  `Vm` 建新 `Frame`（见 D5 §调用约定）。
-- **`JsNativeFn`**：用 Kotlin lambda 实现 `console.log`、数组方法等（`Intrinsics`）。无字节码、
-  无 upvalue，直接进入 Kotlin，是性能热点（如 `Array.map`）。
-- **`JsBoundFn`**：`fn.bind(thisArg, ...args)` 的产物，调用时把 `this` 与预置参数拼到实际参数前。
-
-## 5. 作用域 Env
-
-`Env`（`runtime/JsObject.kt` 或独立文件）是实现 `let/const`/块级作用域的链：
-
-```mermaid
-graph TD
-    G[globalEnv] -->|块| B1[块 env: x]
-    B1 -->|函数| F[函数 env: a,b]
-    F -->|with/catch| C[catch env: e]
-```
-
-`resolveOwner(name)`：从当前 `Env` 沿链向上找持有 `name` 的 `Env`，返回它——这是 `GlobalIc`
-（D7）缓存的"名字 → 拥有者 Env"的慢路径。块级 `let` 在 `Env` 链上，函数级 `var` 在 `Frame.locals`
-槽；二者互补。
-
-## 6. Realm：世界的根
-
-`Realm`（`runtime/Realm.kt:15`）是一个 JS 执行"世界"的全部全局状态：
-
-```kotlin
-15:50:engine/src/main/kotlin/io/kjs/runtime/Realm.kt
+7:27:engine/src/main/kotlin/io/kjs/runtime/Realm.kt
 class Realm {
-    val globalObj = JsObject(proto = null)        // globalThis
-    val globalEnv = Env(parent = null)            // 全局作用域
-    val objectProto = JsObject(proto = null)      // Object.prototype
-    val functionProto = JsObject(proto = objectProto)
-    val arrayProto = JsObject(proto = objectProto)
-    // 各类原型：Array/Function/String/Number/Boolean/Symbol/Error...
+    val objectProto = JsObject(null)
+    val functionProto = JsObject(objectProto)
+    val arrayProto = JsObject(objectProto)
+    // numberProto / stringProto / booleanProto / errorProto ...
+    val globalObject = JsObject(objectProto)
+    val globalEnv = Environment()
+
     init {
-        globalObj.setProto(objectProto)           // globalThis.__proto__ = Object.prototype
-        installIntrinsics(this)                   // 挂 console/Object/Array 等
+        globalEnv.declare("this", globalObject)
+        globalEnv.declare("undefined", JsValues.UNDEFINED)
+        globalEnv.declare("globalThis", globalObject)
+        Intrinsics.install(this)        // 内置函数(D10)
+        IntrinsicsExt.install(this)
+        KjsNamespace.install(this)
     }
 }
 ```
 
-所有内置原型、全局对象、全局作用域都在这里装配。`Engine` 每个实例持一个 `Realm`；
-`globalEnv` 是 `LOAD_GLOBAL` 查找的起点（D7）。
+原型链的"根"是 `objectProto`（`proto = null`）。每个构造器（`Object/Array/...`）在 `install` 时把
+`ctor.prototype` 设为对应 proto，proto 的 `constructor` 指回 ctor，形成标准 JS 原型拓扑。`globalEnv`
+是 `Environment`（见下），`LOAD_GLOBAL` 最终查它（D5 §11）。
 
-## 7. 类型强制（ToXxx）
+## 5. JsFunction 与 Environment：函数与词法作用域
 
-JS 的隐式转换全在 `JsValue.kt` 的 `To*` 函数里：
-
-- `toNumber(v)`：字符串 `"123"`→123，`""`→0，`"abc"`→NaN；`true`→1；`null`→0；
-  `undefined`→NaN；对象→先 `toPrimitive` 再转。
-- `toBoolean(v)`：`0 / -0 / NaN / "" / null / undefined` 为 `false`，其余 `true`；
-  对象恒 `true`。
-- `toPrimitive(v, hint)`：对象先查 `valueOf`，再 `toString`（hint=number 时顺序相反），
-  用于 `a + b` 当任一操作数是对象时。
-- `looseEq(a, b)`（==）：**类型不同先强制**：`null==undefined` 为真；数字 vs 字符串先转数字；
-  对象 vs 原始先 `toPrimitive`；数字 vs BigInt 特殊规则。这是 JS `==` 的全部诡异之源。
-- `strictEq(a, b)`（===）：**先比类型**，类型不同直接 `false`，类型相同再比值
-  （含 `NaN!==NaN`，同引用才算等）。
+`JsFunction`（`JsFunction.kt:8`）继承 `JsObject`（`callable = this`），区分用户函数与宿主函数：
 
 ```kotlin
-90:130:engine/src/main/kotlin/io/kjs/runtime/JsValue.kt
-fun looseAdd(a: Any?, b: Any?): Any? {
-    if (a is String || b is String) return toStr(a) + toStr(b)   // 字符串拼接优先
-    if (a is BigInteger || b is BigInteger) return bigAdd(a, b)
-    return toNumber(a) + toNumber(b)                            // 否则数值加
+8:47:engine/src/main/kotlin/io/kjs/runtime/JsFunction.kt
+class JsFunction private constructor(
+    val name: String, val params: List<String>, val body: Block?,
+    val closure: Environment?,                              // 用户函数的词法环境
+    val native: ((thisVal: Any?, args: List<Any?>) -> Any?)?,  // 宿主函数 lambda
+) : JsObject() {
+    var invoker: ((JsFunction, Any?, List<Any?>) -> Any?)? = null   // VM 闭包走这里
+    var vmClosure: Any? = null                                   // 已编译字节码的句柄(不透明)
+    fun call(thisVal: Any?, args: List<Any?>): Any? {
+        invoker?.let { return it(this, thisVal, args) }         // 优先 invoker(VM/用户)
+        if (native != null) return native.invoke(thisVal, args)  // 否则宿主 lambda
+        error("Function '$name' has no body")
+    }
+    // companion: user(...) / native(...) 工厂
 }
 ```
 
-`+` 的语义：**任一操作数是字符串就拼接**，否则数值加——这与直觉相反的地方（如 `1 + {}`）都
-由 `toPrimitive` 兜底。
+- **`native` 宿主函数**：由 `JsFunction.native(name, arity, fn)` 创建，调 `call` 时走 `native.invoke`
+  （D10 的内置库、CLI 都这样接入）。
+- **用户函数**：`closure` 是定义处的 `Environment`；VM 用 `vmClosure` 挂编译产物（D5 §1）；Walker 用
+  `invoker = ::callUserFn` 走树遍历（D9）。
+- **`__arrow__` 标记**：箭头函数的 `this` 不重新绑定，VM 的 `CALL_METHOD` 与 Walker 的 `evalCall`
+  据此沿用外层 `this`。
 
-## 8. 设计取舍
+`Environment`（`JsFunction.kt:51`）是**词法作用域链**：`HashMap` 存名→值，`parent` 指外层环境：
 
-- **Undefined 用单例而非 null**：保住 `undefined` 与 `null` 的区分（语义正确性优先）。
-- **Number 统一用 Double**：简单一致；整数运算有精度上限但符合 JS 规范（JS 本来就是双精度）。
-- **own 用 LinkedHashMap + IC 缓存**：通用查找正确，热点走 IC/隐藏类加速。
-- **函数分三类**：用户函数（需 VM）、宿主函数（Kotlin 直跑）、bound（粘合），职责清晰。
+```kotlin
+51:88:engine/src/main/kotlin/io/kjs/runtime/JsFunction.kt
+class Environment(val parent: Environment? = null) {
+    fun has(name: String): Boolean { var e = this; while (e != null) { if (e.vars.containsKey(name)) return true; e = e.parent }; return false }
+    fun get(name: String): Any? { var e = this; while (e != null) { if (e.vars.containsKey(name)) return e.vars[name]; e = e.parent }; return UNDEFINED }
+    fun set(name: String, value: Any?): Boolean { /* 向上找已有绑定写入 */ }
+    fun setOrDeclareGlobal(name: String, value: Any?) { if (!set(name, value)) { /* 走到根环境声明 */ } }
+    fun resolveOwner(name: String): Environment? { /* 返回拥有该名的 Environment, 供 IC(D7) */ }
+}
+```
 
-## 9. 常见坑
+- `has/get/set` 都**沿 `parent` 链向上找**，实现嵌套作用域（块级 `let` 用 `Environment(env)` 子环境，
+  D9 §3）。
+- `setOrDeclareGlobal`（`JsFunction.kt:67`）：`=` 给未声明变量赋值时，沿链找不到就创建到**根环境**
+  （非严格模式语义）。
+- `resolveOwner`（`JsFunction.kt:80`）：返回拥有该名的 `Environment`，供 `GlobalIc`（D7 §2）缓存，
+  "缓存的是拥有者 map"而非值——所以 `=` 后更新立即可见。
 
-- **`typeof null === "object"`**：历史包袱，KJS 照规范实现，`isNull` 单独用 `== null` 判。
-- **`NaN !== NaN`**：`strictEq` 必须特判，否则 `indexOf` 等逻辑错。
-- **`{}+{}` 在不同位置语义不同**：语句首的 `{}` 会被当成空块，导致 `+{}` 变成 `+""` → `0`。
-  KJS 的 ASI 处理决定这里的解析。
-- **BigInt 与 Number 不能混运算**：`1 + 2n` 抛 `TypeError`，在 `looseAdd`/`ToNumber` 处检查。
-- **原型链查找未缓存**：同一属性每次都爬链会 O(depth)；JIT/IC 解决（D7/D8）。
+## 6. 设计取舍
+
+- **`Any?` 统一装箱**：实现简单、VM/`Frame.locals` 直接复用；代价是数字也走堆对象（M2 计划换
+  NaN-boxing 的 `Long`）。
+- **强制集中 `JsValues`**：VM 与 Walker 共享，是双后端一致性的根基。
+- **`className` 当 shape 键**：轻量形状标记，足够驱动单态 IC（D7），避免完整 HiddenClass。
+- **原型链靠委托**：`get` 沿 `proto` 走，最简单直观；未做形状内联缓存的"隐藏类"优化（M2 方向）。
+- **`Environment` 链即作用域**：与编译器的 scope 链（D4 §2）一一对应，`closure` 在 `JsFunction` 上
+  封存，闭包捕获由此落地。
+
+## 7. 常见坑
+
+- **`undefined` vs `null`**：两者在 `Any?` 中是不同值（`Undefined` 单例 vs JVM `null`），`looseEq`
+  故意让它们相等（`==`），但 `===` 不等，处理时别混淆。
+- **`NaN` 比较**：`strictEq` 中 `NaN !== NaN`；`looseEq` 同理。涉及数字相等务必走 `JsValues`
+  而非 Kotlin `==`。
+- **原型链无限查找**：`get` 沿 `proto` 走，若原型环会死循环——KJS 原型链默认无环，但宿主挂 proto 时
+  要注意。
+- **数组 `length` 维护**：`set` 下标 `>= length` 自动扩长；`pop` 要显式 `properties.remove` + 降
+  `length`，否则残留元素。
+- **`className` 当 shape 键的局限**：同名不同结构的对象共享同一 `className`，`PropIc` 可能误命中
+  （靠 `cachedOwner.hasOwn(name)` 二次校验兜底，D7 §1）。
+- **`closure` 捕获的是 `Environment` 引用**：多个闭包共享同一 `Environment` 即共享其变量，配合
+  Upvalue 盒子（D5 §9）实现捕获语义。

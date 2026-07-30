@@ -1,158 +1,152 @@
-# D3 · 字节码与指令集
+# D3 · 字节码与指令集 Bytecode
 
-> 前置知识：D1、D2。本篇讲"AST 编译成的产物长什么样"，这是理解 VM（D5）和 JIT（D8）的基础。
+> 前置知识：D0（管线）、D2（AST）。
+>
+> 本篇拆解 `ir/Bytecode.kt` 与 `ir/Opcode.kt`：编译产物为何用"三条并行 IntArray"表示、常量池如何
+> 去重、跳转如何修补、以及 `disasm` 如何反汇编。读完能理解 VM（D5）脚下那层数据结构。
 
-## 1. 三条并行 IntArray 车道
+## 1. 为什么是三条并行 IntArray
 
-KJS 字节码最反直觉也最关键的设计：**不用 opcode 对象数组，而用三个并行的 `IntArray`**。
-`Bytecode`（`ir/Bytecode.kt:11`）字段：
+VM 是栈式字节码机，`Bytecode`（`Bytecode.kt:12`）把"指令流"与"操作数"分离成三条**等长**车道：
 
 ```kotlin
-11:40:engine/src/main/kotlin/io/kjs/ir/Bytecode.kt
-class Bytecode(val sourceName: String) {
-    var codeA = IntArray(64)      // opcode（见 Opcode 枚举的 ordinal）
-    var aOpsA = IntArray(64)      // 操作数 A
-    var bOpsA = IntArray(64)      // 操作数 B
-    var countA = 0                // 已写指令数
-    // 常量 / 字符串 / 函数池
-    val constants = mutableListOf<Any?>()
-    val strings = mutableListOf<String>()
-    val functions = mutableListOf<Bytecode>()
-    // 内联缓存槽（LOAD_PROP/LOAD_GLOBAL 用）
-    var caches = mutableListOf<PropIc>()
-    val nameToIdx = mutableMapOf<String, Int>()
-    var arity = 0
-    var name: String? = null
-    ...
+12:30:engine/src/main/kotlin/io/kjs/ir/Bytecode.kt
+class Bytecode(val name: String, var paramCount: Int) {
+    val code = mutableListOf<Int>()        // 车道0: opcode 整数
+    val aOps = mutableListOf<Int>()        // 车道1: 操作数 A（多数指令用）
+    val bOps = mutableListOf<Int>()        // 车道2: 操作数 B（少数指令用）
+    var codeA = IntArray(0)                // freeze 后的只读快照（见 §4）
+    var aOpsA = IntArray(0)
+    var bOpsA = IntArray(0)
+    val constants = mutableListOf<Any?>()  // 常量池: 数字/字符串/BigInt…
+    val strings = mutableListOf<String>()  // 字符串池: 属性名/literal
+    val functions = mutableListOf<Bytecode>()  // 子函数池: MAKE_CLOSURE 取用
+    var localCount = 0                     // 本函数的局部槽总数（含参数 + 临时）
+    var caches: Array<Any?>? = null        // 内联缓存槽（按 pc 索引, D7）
+    var upvalueInfo: List<Upvalue> = emptyList()  // 本函数要捕获的 upvalue 来源
 }
 ```
 
-为什么这么做？
+对比"把每条指令做成对象"的方案（如 `class AddInstr`），并行 IntArray 的好处是：**连续内存、零
+对象分配、VM 用 `code[pc++]` 顺序读取无指针跳跃**，且 opcode 是 `Int`，可直接 `OP_VALUES[code[pc]]`
+查表（D5 §8）。这正是它快于"对象指令流"的根本。
 
-- **缓存友好**：VM 主循环（`Vm.kt`）顺序读 `codeA[i]`，三个数组在内存里是连续的 `int`，
-  预取器能一路读下去；若用 `Op(op,a,b)` 对象数组，每个对象散落堆上，缓存命中率差、GC 压力高。
-- **零对象分配**：指令本身不占对象，编译期只 `emit(op,a,b)` 往数组填数（见下）。
-- **可直接喂 JIT**：ASM 生成代码时也按 `codeA/aOpsA/bOpsA` 顺序读，和 VM 同构（D8）。
+> 为什么 A/B 两条操作数？多数指令只用一个操作数（如 `LOAD_LOCAL a`），少数（`JMP_IF_FALSE a b`、
+> `CALL argc b`）需要两个。`a` 常是"池索引/跳转目标/槽号"，`b` 常是"标志位"（如 `LOAD_GLOBAL`
+> 的"容忍未定义"标志）。这种固定 2 操作数布局让 `when` 分支统一读 `a/b`。
 
-> 数组初始 64，写满时 `grow()` 翻倍。大多数函数远小于 64 条，几乎不触发扩容。
+## 2. 常量池与去重
 
-## 2. 发射与冻结
+`constIdx`/`strIdx`（`Bytecode.kt:42`）把相同常量合并到池里、返回下标；`fnIdx` 把子函数加进
+`functions` 池。池下标即字节码里传的 `a`：
 
 ```kotlin
-42:60:engine/src/main/kotlin/io/kjs/ir/Bytecode.kt
-fun emit(op: Opcode, a: Int = 0, b: Int = 0): Int {
-    ensureCapacity(countA + 1)
-    codeA[countA] = op.ordinal   // 用枚举 ordinal 当紧凑 int
-    aOpsA[countA] = a
-    bOpsA[countA] = b
-    val here = countA
-    countA++
-    return here                   // 返回该指令下标，供跳转修补
-}
+42:52:engine/src/main/kotlin/io/kjs/ir/Bytecode.kt
+fun constIdx(v: Any?): Int { var i = constants.indexOf(v); if (i < 0) { i = constants.size; constants.add(v) }; return i }
+fun strIdx(s: String): Int { var i = strings.indexOf(s); if (i < 0) { i = strings.size; strings.add(s) }; return i }
+fun fnIdx(f: Bytecode): Int { var i = functions.indexOf(f); if (i < 0) { i = functions.size; functions.add(f) }; return i }
+```
+
+> 注意这里用 `indexOf` 去重：相同字符串/数字只占一个池槽，省内存也利于 IC 形状比较（D7）。
+
+## 3. 发射与跳转修补（emit / patchA / patchB）
+
+编译器一边顺序 `emit`，一边在"跳转目标未知"时打**占位指令**，最后回填：
+
+```kotlin
+53:62:engine/src/main/kotlin/io/kjs/ir/Bytecode.kt
+fun emit(op: Op, a: Int = 0, b: Int = 0) { code.add(op.ordinal); aOps.add(a); bOps.add(b) }
+fun emitNumber(v: Number) = emit(Op.CONST, constIdx(v.toDouble()))
+fun emitString(s: String) = emit(Op.LOAD_CONST_STR, strIdx(s))
+fun patchA(at: Int, a: Int) { aOps[at] = a }   // 回填操作数 A（如跳转目标）
+fun patchB(at: Int, b: Int) { bOps[at] = b }   // 回填操作数 B
+```
+
+典型用法（Compiler 的 `compileIf`，D4 §7）：先 `emit(JF, 0)` 占位，编译 then 分支记下 `thenEnd`，
+再 `patchA(jfAt, thenEnd)` 让假跳转到 then 之后。**附带指令**的 `at` 由 `code.size-1`（最后发出的
+那条）取得——因此补丁点必须"紧跟在 emit 之后立刻记录"，否则 `code.size-1` 指向别处。
+
+## 4. freeze：从可变 List 到不可变快照
+
+编译完需要把可变 `MutableList` 冻结成 `IntArray` 供 VM 高速顺序读：
+
+```kotlin
+68:73:engine/src/main/kotlin/io/kjs/ir/Bytecode.kt
 fun freeze() {
-    codeA = codeA.copyOf(countA)  // 裁掉多余容量
-    aOpsA = aOpsA.copyOf(countA)
-    bOpsA = bOpsA.copyOf(countA)
+    codeA = code.toIntArray(); aOpsA = aOps.toIntArray(); bOpsA = bOps.toIntArray()
+    constants_n = constants.toTypedArray(); strings_n = strings.toTypedArray(); functions_n = functions.toTypedArray()
 }
 ```
 
-`emit` 返回写入位置的 `here`，这是**跳转修补**的关键（D4 的 if/while/for）。
+`codeA/aOpsA/bOpsA`（`Bytecode.kt:18`）就是 VM 真正读取的车道（见 D5 §8 的 `OP_VALUES[code[pc]]`）。
+`caches` 是**惰性的**（`null` 直到首次 `LOAD_PROP` 才建数组，D5 §10 / D7），故不在 freeze 里初始化。
 
-## 3. 常量 / 字符串 / 函数池
+## 5. 反汇编（disasm）
 
-- `constants`：数字、BigInt、正则等直接值。
-- `strings`：标识符、字符串字面量（用 `addString` 去重，返回下标 `b` 操作数）。
-- `functions`：嵌套函数/箭头/closures 的**子 Bytecode**，递归编译；`MAKE_CLOSURE` 的 `b`
-  指向这里的下标。
-- `nameToIdx`：命名函数表（供 `function f(){}` 调用自身 / 堆栈回溯）。
-- `arity`：形参个数（用于 `arguments` 长度与 rest 参数）。
-
-## 4. 指令集（Opcode.kt 节选）
-
-```mermaid
-flowchart LR
-    subgraph 加载/存储
-      L0[LOAD_NULL/TRUE/FALSE/UNDEFINED]
-      L1[LOAD_CONST a] L2[LOAD_STR b] L3[LOAD_LOCAL a]
-      L4[STORE_LOCAL a] L5[LOAD_PROP a] L6[STORE_PROP a]
-      L7[LOAD_GLOBAL b] L8[STORE_GLOBAL b]
-      L9[LOAD_THIS] L10[MAKE_CLOSURE b a]
-    end
-    subgraph 运算
-      O1[ADD SUB MUL DIV ...]
-      O2[EQ NEQ STRICT_EQ ...]
-      O3[NOT NEG TYPEOF ...]
-    end
-    subgraph 控制流
-      C1[JMP b] C2[JMP_IF_FALSE b] C3[JMP_IF_TRUE b]
-      C4[CALL a b] C5[CALL_METHOD a b c] C6[NEW a b]
-      C7[RETURN] C8[RETURN_UNDEF]
-    end
-    subgraph 结构化
-      S1[PUSH_SCOPE/POP_SCOPE]
-      S2[TRY_PUSH/TRY_POP]
-      S3[ITER_INIT/ITER_NEXT/ITER_JUMP]
-      S4[THROW]
-    end
-```
-
-按用途分类（`ir/Opcode.kt`）：
-
-| 类 | 代表 opcode | a / b 含义 |
-|----|------------|-----------|
-| 常量/字面 | `LOAD_CONST a`、`LOAD_STR b`、`LOAD_NULL` | `a`=常量池下标，`b`=字符串池下标 |
-| 局部变量 | `LOAD_LOCAL a`、`STORE_LOCAL a`、`LOAD_THIS` | `a`=槽位 |
-| 属性 | `LOAD_PROP a`、`STORE_PROP a` | `a`=IC 槽下标（见缓存） |
-| 全局 | `LOAD_GLOBAL b`、`STORE_GLOBAL b` | `b`=字符串池里的名字（含 IC） |
-| 闭包 | `MAKE_CLOSURE b a` | `b`=functions 池，`a`=upvalue 个数 |
-| 运算 | `ADD/SUB/MUL/DIV/EQ/NEQ/TYPEOF/NOT/…` | 多从操作数栈取 |
-| 控制流 | `JMP b`、`JMP_IF_FALSE b`、`CALL a b`、`NEW a b` | `b`=跳转目标指令下标/`a b`=参数个数 |
-| 异常 | `TRY_PUSH h`、`TRY_POP`、`THROW` | `h`=handler 区起始 |
-| 迭代 | `ITER_INIT`、`ITER_NEXT b`、`ITER_JUMP b` | for-in/for-of |
-| 作用域 | `PUSH_SCOPE`、`POP_SCOPE` | `with`/块级作用域 |
-| 返回 | `RETURN`、`RETURN_UNDEF` | 弹出栈顶为返回值 |
-
-> 注意 `LOAD_PROP` 的 `a` 与 `LOAD_GLOBAL` 的 `b` 并不直接是属性名下标，而是 **IC 槽下标**——
-> 真正的名字在 `caches[a]`（或更早的 stages）里缓存。这是 D7 的核心。
-
-## 5. 反汇编 `disasm()`
-
-`Bytecode.disasm()`（`Bytecode.kt:70`）把三条车道翻译成可读文本，是 debug 与 `--trace` 的命脉：
-
-```text
-0  LOAD_STR        b=0        ; "x"
-2  LOAD_CONST      a=1        ; 1
-4  ADD
-5  STORE_LOCAL     a=0
-7  RETURN_UNDEF
-```
-
-配合 `Tracer.onBytecode` 在 `Engine.eval` 里打印，你能直接看到每段源码编译成什么。
-
-## 6. 与 VM 的契约
-
-VM 主循环（`Vm.kt`）就是：
+`disasm`（`Bytecode.kt:98`）把字节码还原成可读的文本，主要供 `Tracer` 与调试：
 
 ```kotlin
-while (pc < countA) {
-    val op = Opcode.fromOrdinal(codeA[pc])
-    when (op) { ... aOpsA[pc] ... bOpsA[pc] ... pc++ }
+98:114:engine/src/main/kotlin/io/kjs/ir/Bytecode.kt
+fun disasm(): String {
+    val sb = StringBuilder()
+    for (i in codeA.indices) {
+        val op = OP_VALUES[codeA[i]]
+        val a = aOpsA[i]; val b = bOpsA[i]
+        sb.append(String.format("%4d: %-14s a=%-4d b=%-4d", i, op.name, a, b))
+        when (op) {
+            Op.LOAD_CONST_STR -> sb.append(" ; \"${strings_n[a]}\"")
+            Op.CONST -> sb.append(" ; ${constants_n[a]}")
+            Op.LOAD_LOCAL, Op.STORE_LOCAL -> sb.append(" ; slot $a")
+            Op.JMP, Op.JT, Op.JF -> sb.append(" ; -> $a")
+            else -> {}
+        }
+        sb.append('\n')
+    }
+    return sb.toString()
 }
 ```
 
-`Opcode.fromOrdinal` 是 `entries[ordinal]`——一个数组下标，零成本。
+它顺便把"池下标 → 实际常量/字符串"解析出来，看反汇编就能定位每条指令的语义。编译器在 `compileProgram`
+末尾统一 `freeze()` 再交 VM（`Compiler.kt:43` 后由 `Engine.kt:52` 触发）。
+
+## 6. 指令集（Opcode.kt）
+
+`Op`（`Opcode.kt:17`）是全部指令的枚举，VM 的 `when(op)`（D5 §8）逐条实现。按职责分组：
+
+- **常量/加载**：`CONST`（数字）、`LOAD_CONST_STR`、`LOAD_NULL`、`LOAD_TRUE`、`LOAD_FALSE`、
+  `LOAD_UNDEFINED`、`LOAD_THIS`、`LOAD_ARGUMENTS`。
+- **栈/局部/参数**：`DUP`、`POP`、`LOAD_LOCAL`、`STORE_LOCAL`、`LOAD_ARG`、`STORE_ARG`、
+  `LOAD_GLOBAL`、`STORE_GLOBAL`、`DECL_GLOBAL`。
+- **属性/下标**：`LOAD_PROP`、`STORE_PROP`、`LOAD_ELEM`、`STORE_ELEM`、`LOAD_PROP_BYVAL`、
+  `DEL_PROP`。
+- **运算**：`ADD`、`SUB`、`MUL`、`DIV`、`MOD`、`POW`、`NEG`、`INC`、`DEC`；`BITAND/BITOR/BITXOR/
+  SHL/SHR/USHR`；`LT/GT/LE/GE/EQ/NEQ/SEQ/SNEQ`；`AND_LOG/OR_LOG`（理论保留，编译器改用 `JF_KEEP`）。
+- **构造**：`MAKE_OBJECT`、`MAKE_ARRAY`、`MAKE_FUNCTION`/`MAKE_CLOSURE`、`MAKE_CLASS_INSTANCE`。
+- **控制流**：`JMP`、`JT`、`JF`、`JT_KEEP`、`JF_KEEP`、`RET`、`RET_UNDEF`、`HALT`；`PUSH_BLOCK`、
+  `POP_BLOCK`（块级作用域边界）。
+- **调用/构造**：`CALL`、`CALL_METHOD`、`NEW_OP`、`SPREAD`（展开实参）、`STASH_RESULT`。
+- **闭包**：`LOAD_UPVAL`、`STORE_UPVAL`、`MAKE_CLOSURE`。
+- **异常**：`THROW`、`TRY_ENTER`、`TRY_EXIT`、`END_FINALLY`。
+- **迭代**：`FOR_IN_INIT`、`FOR_IN_NEXT`、`FOR_OF_INIT`、`FOR_OF_NEXT`。
+
+末尾 `OP_VALUES`（`Opcode.kt:104`）是 `{ordinal → Op}` 反向表，VM 用它把 `code[pc]` 的整数瞬间映射
+回枚举，零分支成本。
 
 ## 7. 设计取舍
 
-- **为什么用 `IntArray` 而非 `ByteArray`？** 操作数可能超过 255（常量池、函数池、跳转距离），
-  直接 `int` 省去编解码。
-- **为什么 opcode 用 ordinal 而非字符串？** `when(op)` 编译成 JVM `tableswitch`，比字符串比较快得多。
-- **为什么常量池独立于代码？** 共享同一份字符串/数字，避免每条指令都内嵌大对象；JIT 期也能复用。
+- **并行 IntArray 而非对象流**：连续内存 + 整数 opcode 查表，是性能内核；代价是"跳转修补"需显式
+  管理（§3）。
+- **A/B 双操作数固定布局**：`when` 分支统一读 `a/b`，少数双操作数指令自然复用。
+- **常量池去重**：相同字面量只占一槽，省内存且利于 IC 形状比较。
+- **caches 惰性**：无属性访问的函数完全不分配 IC 数组。
+- **freeze 不可变化**：编译完成后字节码只读，VM 可放心共享，无并发写风险。
 
 ## 8. 常见坑
 
-- **跳转目标越界**：`emit` 返回的 `here` 是写入时下标，跳转修补时要回填 `bOpsA[here]`（D4）。
-  若漏补，VM 会跳到 `0` 或越界 → 死循环 / 崩溃。
-- **`countA` 必须在 `freeze` 前正确**：`freeze` 裁数组副本，之后任何 `emit` 都会写到旧长度之外。
-- **IC 槽需在 emit 时分配**：`LOAD_PROP` 的 `a` 必须在编译期通过 `bc.addPropCache()` 预留，
-  否则运行时 IC 数组下标错乱（D7）。
+- **补丁点 `code.size-1`**：若 `emit` 后又 `emit`（如补丁前插了别的指令），`code.size-1` 指向错误，
+  跳转目标错乱。务必"emit 占位后立即记录 at"。
+- **池去重副作用**：`indexOf` 依赖 `equals`，自定义值若未正确实现 `equals` 会重复入池或错配。
+- **freeze 前不可执行**：VM 读 `codeA`，未 freeze 时为空。Compiler 必须在 `compileProgram` 末尾
+  freeze（编译器内部子函数也各自 freeze）。
+- **`caches` 未解冻**：`caches` 是运行时状态，不跟随 `freeze`；同一 `Bytecode` 被多 Frame 并发执行
+  时 `caches[pc]` 需线程安全（本 VM 单线程，未加锁）。

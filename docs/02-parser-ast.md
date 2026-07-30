@@ -1,146 +1,136 @@
-# D2 · AST 与语法分析 Parser
+# D2 · 语法分析：Parser 与 AST
 
-> 前置知识：D1。本篇讲"token 流如何拼成树"，重点是节点模型和递归下降 / 运算符优先级。
+> 前置知识：D0（管线）、D1（Lexer）。
+>
+> 本篇拆解 `parse/Parser.kt` 与 `parse/Ast.kt`：AST 节点模型、递归下降骨架、表达式的"优先级爬升"、
+> 解构/箭头/`for-of` 等语法糖在 AST 阶段的展开。读完能理解"Token 流如何变成结构化的 Program"。
 
-## 1. 节点模型（Ast.kt）
+## 1. AST 节点模型（Ast.kt）
 
-AST 以 `Node` 为根接口，按"是否是表达式（有值）"分两条子接口：`Expr : Node`（如 `BinaryExpr`
-、`CallExpr`、`ArrowFnExpr`）与 `Stmt : Node`（如 `IfStmt`、`ForStmt`、`VarDecl`）。还有 `Decl`
-和 `Pattern`（用于解构）。
+AST 用一组 `sealed class` 表达（单继承层次，便于 `when` 穷尽匹配）：
 
-顶层 `Program`（`parse/Ast.kt:14`）持有 `body: MutableList<Stmt>`。
+- **`Node`**（`Ast.kt:7`）：所有节点基类，带 `line/col` 用于报错。
+- **`Program`**（`Ast.kt:10`）：`body: List<Stmt>`，整棵语法树根。
+- **语句 `Stmt`**（`Ast.kt:12`）：`Block / ExprStmt / VarDecl / If / While / DoWhile / ForC /
+  ForIn / ForOf / Return / Break / Continue / Throw / Try / FunctionDecl / ClassDecl / Labeled /
+  EmptyStmt`。
+- **声明 `Declarator`**（`Ast.kt:20`）：`name`（标识符绑定）与 `pattern`（解构绑定）**恰有一个非空**。
+- **`ClassDecl`**（`Ast.kt:49`）：`superClass / constructor / members`；VM 无原生 class，由 Compiler
+  解语法糖为构造函数（D4 §6）。
+- **`Param`**（`Ast.kt:74`）：`name` 与 `pattern` 恰有一个非空，外加 `default`、`rest` 标记。
+- **解构 `Pattern`**（`Ast.kt:90`）：`IdentPattern / ArrayPattern / ObjectPattern / AssignTargetPattern`，
+  可递归嵌套，是解构声明与解构赋值的统一表示。
+- **表达式 `Expr`**（`Ast.kt:99`）：`NumberLit / StringLit / Ident / ArrayLit / ObjectLit /
+  FunctionExpr / ArrowFn / ClassExpr / Unary / Update / Binary / Logical / Assign / Conditional /
+  Member / Call / NewExpr / Sequence / TemplateLit / DestructuringAssign / SuperMember / SuperCall` 等。
 
-关键表达式节点（节选）：
-
-```kotlin
-20:60:engine/src/main/kotlin/io/kjs/parse/Ast.kt
-sealed interface Node { val loc: Loc? }
-sealed interface Expr : Node
-sealed interface Stmt : Node
-sealed interface Decl : Stmt
-sealed interface Pattern : Node
-
-data class BinaryExpr(val op: String, val left: Expr, val right: Expr) : Expr
-data class CallExpr(val callee: Expr, val args: List<Expr>) : Expr
-data class MemberExpr(val obj: Expr, val prop: Expr, val computed: Boolean) : Expr
-data class ArrowFnExpr(val params: List<Param>, val body: BlockStmt, val isExprBody: Boolean) : Expr
-data class ClassExpr(val name: String?, val superClass: Expr?, val body: List<ClassMember>) : Expr
-data class AssignExpr(val target: Expr, val value: Expr) : Expr   // 含解构目标
-```
-
-注意 `AssignExpr.target` 是 `Expr` 而非 `Pattern`——解构赋值（如 `[a,b] = c`）在 AST 层被
-desugar 成多个单赋值（见 D4），这里只存"看起来像赋值目标"的节点。
-
-语句节点（节选）：`IfStmt`、`WhileStmt`、`ForStmt`、`ForInStmt`、`ForOfStmt`、`TryStmt`
-（含 `catch`/`finally`）、`ReturnStmt`、`BlockStmt`、`VarDecl`（`kind: var/let/const`，
-`decls: List<VarDeclarator>`）、`FunctionDecl`、`ClassDecl`、`ThrowStmt`、`BreakStmt`/`ContinueStmt`。
+> 设计要点：`AssignTargetPattern`（`Ast.kt:96`）把"可作为赋值目标的复杂表达式（成员访问、下标）"
+> 统一成 Pattern，使解构赋值的 LHS 复用同一套绑定逻辑。
 
 ## 2. 递归下降骨架
 
-`Parser`（`parse/Parser.kt:30`）持有 `tokens` 与 `pos`，提供：
-- `peek()` / `peek(k)` / `advance()` / `expect(type,value)` / `match(type,value)`。
-- `parseProgram()`：循环 `parseStmt()` 直到 `EOF`。
+`Parser`（`Parser.kt:13`）构造时即 `Lexer(source).tokenize()`（`Parser.kt:14`）得到 `tokens`，
+`pos` 为当前下标。工具函数 `peek/eat/match`（`Parser.kt:25`）提供前瞻与消费，每个 `eat(t)` 在类型
+不符时抛 `ParseError`（带行列）。
 
-`parseStmt` 是典型的"看第一张牌决定做什么"：
+`statement()`（`Parser.kt:58`）是语句级分发，覆盖标签语句、块、`var/let/const`、`if/while/do/for`、
+`return/break/continue/throw/try`、函数声明、class 声明、表达式语句等。`block()`（`Parser.kt:84`）
+循环解析直到 `}`。
 
-```kotlin
-120:150:engine/src/main/kotlin/io/kjs/parse/Parser.kt
-private fun parseStmt(): Stmt = when (val t = peek()) {
-    isTok KEYWORD "if"      -> parseIf()
-    isTok KEYWORD "while"   -> parseWhile()
-    isTok KEYWORD "for"     -> parseFor()
-    isTok KEYWORD "function"-> parseFunctionDecl()
-    isTok KEYWORD "class"   -> parseClassDecl()
-    isTok KEYWORD "return"  -> parseReturn()
-    isTok KEYWORD "var",
-    isTok KEYWORD "let",
-    isTok KEYWORD "const"   -> parseVarDecl()
-    isTok PUNCT "{"         -> parseBlock()
-    else -> {                              // 表达式语句
-        val e = parseExpr()
-        expect(PUNCT, ";")        // 允许 ASI 自动补分号
-        ExprStmt(e)
-    }
-}
+### 2.1 声明与解构
+
+`varDecl()`（`Parser.kt:92`）支持 `var/let/const` 列表，每项可为普通标识符或**绑定模式**（数组/
+对象解构，见 `bindingPattern` `Parser.kt:112`）。`objectBindingPattern`（`Parser.kt:139`）处理
+`{a, b: c, d = 1, ...rest}`：简写 `{x}` 即 `IdentPattern("x")`，`...rest` 提升为 `rest` 字段。
+`exprToPattern`（`Parser.kt:181`）把已按普通表达式解析的 `[a,b]`/`{x}` 反向转成 Pattern——因为解析
+器事前不知道它是赋值目标，先当表达式解析，发现是解构赋值 LHS 时再"降级"成 Pattern。
+
+## 3. 表达式：优先级爬升（核心算法）
+
+表达式解析是 Parser 最精妙处，采用**经典优先级爬升**（precedence climbing）：每个层级只比下一
+层级高一级，用 `while (at(...))` 左结合地吸收同优先级的运算。层级从低到高（`Parser.kt:400`）：
+
+```
+expression  → assignment (, assignment)*      → Sequence
+assignment  → conditional (= += ... ) assignment   (右结合)
+conditional → logicalOr ? assignment : assignment
+logicalOr   → logicalAnd (|| / ??)* logicalAnd
+logicalAnd  → bitOr (&&)* bitOr
+bitOr/bitXor/bitAnd → equality → relational → shift → additive → multiplicative
+multiplicative → exponent  (** 右结合)
+exponent    → unary (** exponent)            // 右结合，单独处理
+unary       → (! ~ + - typeof void delete ++ --) unary | postfix
+postfix     → leftHandSide (++ --)?          // 后缀 ++/--
+leftHandSide→ (new) primary (. [] ( ) 链式)*  // 成员/下标/调用
+primary     → 字面量 / Ident / 数组 / 对象 / 函数表达式 / ...
 ```
 
-> 伪代码 `isTok KEYWORD "if"` 表示调用 `match(TokenType.KEYWORD, "if")`。
-
-## 3. 运算符优先级与结合性（核心）
-
-表达式用**优先级爬升（precedence climbing）**解析，避免为每个优先级写一层函数：
+关键点：
+- **`exponent` 的右结合**（`Parser.kt:495`）：`a ** b ** c` 解析为 `a ** (b ** c)`，因 `exponent`
+  右侧递归回 `exponent` 而非 `unary`。
+- **`unary` 的左递归终止**（`Parser.kt:501`）：前缀运算符后递归到 `unary`（允许 `!!x`），否则落
+  到 `postfix`。
+- **`leftHandSide` 的成员/调用链**（`Parser.kt:524`）：`a.b()[c].d` 用循环不断叠加 `Member/Call`，
+  每次把当前表达式作为 `obj` 包新一层，保证 `a.b().c` 的 AST 是右结合的成员链。
+- **`assignment` 的右结合**（`Parser.kt:409`）：`a = b = c` → `a = (b = c)`；若 LHS 是 `ArrayLit/
+  ObjectLit` 则转 `DestructuringAssign`（`Parser.kt:430`）。
 
 ```mermaid
 flowchart TD
-    A[parseExpr] --> B[parseAssign 优先级 10]
-    B --> C[parseBinary 0]
-    C -->|左操作数| D[parseUnary]
-    D --> E[parsePostfix: 调用/成员/小标]
-    E --> F[parsePrimary: 字面量/标识符/分组]
-    C -->|op 优先级>p| G[递归 parseBinary 继续右结合]
+    A["expression"] --> AS["assignment (右结合)"]
+    AS --> C["conditional (? :)"]
+    C --> LO["logicalOr (||/??)"]
+    LO --> LA["logicalAnd (&&)"]
+    LA --> BO["bitOr"]
+    BO --> BX["bitXor"] --> BA["bitAnd"] --> EQ["equality"]
+    EQ --> REL["relational"] --> SH["shift"] --> ADD["additive"]
+    ADD --> MUL["multiplicative"] --> EXP["exponent (**)"]
+    EXP --> UN["unary (! - typeof ...)"]
+    UN --> PF["postfix (++ --)"]
+    PF --> LHS["leftHandSide (. [] call 链)"]
+    LHS --> PR["primary (字面量/Ident/...)"]
 ```
 
-`parseBinary(minPrec)` 的核心循环：
+## 4. 三个语法糖在 AST 阶段的展开
 
-```kotlin
-300:330:engine/src/main/kotlin/io/kjs/parse/Parser.kt
-private fun parseBinary(minPrec: Int): Expr {
-    var left = parseUnary()
-    while (true) {
-        val op = peek()
-        if (op !is PUNCT) break
-        val prec = BIN_PREC[op.value] ?: break
-        if (prec < minPrec) break
-        advance()
-        // 三元 ?: 与赋值右结合 → 递归时 minPrec 调整
-        val right = if (op.value == "?") parseTernary()
-                     else parseBinary(prec + 1)   // 左结合：(a-b)-c
-        left = BinaryExpr(op.value, left, right)
-    }
-    return left
-}
-```
+### 4.1 箭头函数（`Parser.kt:618` / `parenOrArrow` `636`）
 
-`BIN_PREC` 表（节选，`Parser.kt:280`）：`,`=1，`=` 系列=2，`?:`=3，`||`=4，`&&`=5，
-`|`=6，`^`=7，`&`=8，`==/!=`=9，`</<=/>/>=`=10，`<</>>`=11，`+/-`=12，`*/%`=13，`**`=14。
+`(x) => ...`、`x => ...`、`() => ...` 在 `primary` 与 `parenOrArrow` 里**前瞻 `=>` 判定**：
+`parenOrArrow`（`Parser.kt:636`）先试解析逗号分隔的标识符列表，若 `)` 后是 `=>` 则按箭头函数处理，
+否则 `pos` 回退（`Parser.kt:664`）当普通括号表达式。箭头函数体为表达式时包成 `Return` 块（D4 也
+会处理 `isArrow`，见 D4 §4）。
 
-- **左结合**：`prec + 1` 让同优先级运算符在右侧重新进入时要求**更高**优先级 → `(a-b)-c`；
-  但 **`**`（幂）是右结合**，用 `parseBinary(prec)`（不加 1）→ `a**(b**c)`。
-- **赋值右结合**：`a = b = c` 解析为 `a = (b = c)`，用 `parseBinary(2)` 且只在 `minPrec=2` 进入。
+### 4.2 `for-in` / `for-of` 的解构拆解（`Parser.kt:242`）
 
-## 4. 一元与后缀
+`forStmt` 先按普通 `for(;;)` 解析 init；若 init 是"单声明且无初值"且后跟 `in`/`of`，则识别为
+`ForIn`/`ForOf`（`Parser.kt:251`）。当 LHS 是**解构模式**（非标识符）时，编译器不便直接迭代绑定，
+Parser 在这里**合成一个隐藏临时变量 `__forOfTmpN__`**（`Parser.kt:264`），把循环体包成
+`Block { 解构声明; 原body }`，从而把"模式 LHS"降为"标识符 LHS + 循环内解构"（`Parser.kt:266`）。
+这是把语法糖在 AST 阶段提前消化的典型例子。
 
-`parseUnary` 处理 `! - + typeof void delete ~`，是**前缀**递归；`parsePostfix` 处理链式
-`a.b`、`a[b]`、`a()`、`a` 模板标签，是**后缀**循环（左结合、不回退）。
+### 4.3 模板字符串（`expandTemplate` `Parser.kt:734`）
 
-`new` 运算符特殊：优先级高于调用但会"吃掉"后续参数列表，`Parser` 用一个专门分支处理
-`new X(args)` 且不把 `new X` 后面无括号的情况误判。
+模板 `a${x}b${y}c` 被切分为字面段与 `${}` 插值段：字面段存为 `StringLit`，插值段**用新 `Parser`
+递归解析**（注意支持嵌套 `{}`），最后拼成 `"a" + x + "b" + y + "c"` 的 `Binary(+)` 链。为保证整体
+为字符串拼接，首段若非字面量会前置 `"" + ...`（`Parser.kt:768`）。
 
-## 5. 声明 vs 表达式
+## 5. class 声明（`classDecl` / `classBody`，`Parser.kt:311`）
 
-- **函数声明** `function f(){}` 可 hoist（见 D4）；**函数表达式** `(function(){})` 在 `parsePrimary` 中。
-- **箭头函数** `x => ...` 在 `parsePostfix/parsePrimary` 里识别 `=>`。
-- **对象 / 数组字面量** 在 `parsePrimary` 中，且**支持解构模式**（赋值时见 D4）。
+`classBody`（`Parser.kt:319`）解析成员：识别 `static` 前缀、`get/set` 访问器、`constructor` 单独
+提升为 `constructor` 字段（`Parser.kt:353`），普通方法/字段分别记录。`#私有字段` 因词法器未发 `#`
+暂不支持（代码留了 `isPrivate` 占位，`Parser.kt:345`）。`ClassDecl` 整体交给 Compiler 解糖（D4 §6）。
 
-## 6. 解构在 AST 层的表示
+## 6. 设计取舍
 
-解构**不**引入新节点类型——`@` 数组/对象字面量同时可作"模式"。`Pattern` 接口由
-`ArrayLit`（带 `isPattern` 标记）与 `ObjectLit`（带 `isPattern` 标记）实现，Parser 在赋值
-左值上下文把它们当成模式解析，`VarDeclarator.name` 可为 `Pattern`。 后续 `Compiler`
-把模式 desugar 成逐元素绑定（见 D4 §解构绑定）。
+- **纯递归下降 + 优先级爬升**：无生成器，逻辑直白；爬升法用一层函数对应一个优先级，可读且易扩展。
+- **语法糖前移**：`for-of` 解构、箭头、模板都在 Parser/AST 层尽量展开，减轻 Compiler 负担。
+- **错误定位**：所有 `ParseError` 带 `line/col`，由 Lexer 维护的行列保证可定位。
+- **AST 用 `sealed class`**：编译器可 `when` 穷尽匹配，漏处理节点会编译报错。
 
-## 7. class 在 AST 层
+## 7. 常见坑
 
-`ClassExpr` / `ClassDecl` 直接持有 `body: List<ClassMember>`，成员区分
-`MethodDef`（普通/构造/`get`/`set`）、`FieldDef`（实例字段）。`superClass` 存父类表达式。
-`extends` 在 Parser 阶段只记录，**不**求值——求值推迟到类对象实例化时（D6）。
-
-## 8. 常见坑
-
-- **ASI（自动分号插入）**：KJS 在表达式语句后 `expect(PUNCT,";")` 但允许缺失（多数实现会
-  看行尾换行补分号）。遇到 `return\n{...}` 这类经典 ASI 陷阱需注意：换行会把 `return` 截断。
-- **`in` 关键字**：`for (x in obj)` 与 `x in y` 表达式都合法，Parser 在 `for` 头特殊处理 `in`。
-- **`=>` 与 `>=`**：词法层 `>=` 是一个 PUNCT，会让 `a => b` 在 `a` 后读到 `=>` 必须优先于比较；
-  KJS 在 `parsePostfix` 显式判断 `=>` 之后才进入箭头逻辑，避免与 `>=` 冲突。
-- **逗号运算符 vs 参数列表**：`parseExpr` 顶层用 `BIN_PREC=1` 的逗号处理 `(a,b,c)` 三种上下文，
-  需区分"表达式语句里的逗号"与"参数/数组元素分隔"。
+- **优先级爬升的层级顺序**：层级写错（如把 `&&` 放在 `||` 之下）会改变结合性/优先级语义。
+- **`**` 右结合**：漏掉 `exponent → exponent` 递归会变成左结合，算错 `2**3**2`。
+- **箭头前瞻回退**：`parenOrArrow` 若不 `pos = snapshot` 回退，会吃掉普通括号表达式的 token。
+- **`for-of` 解构合成**：忘记包裹"解构声明"到循环体，会导致模式 LHS 在 Compiler 阶段无法正确绑定。
+- **模板插值递归**：`${}` 内 `{}` 嵌套深度（`depth`）必须配对，否则字符串越界或提前结束。

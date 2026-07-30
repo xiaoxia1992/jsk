@@ -1,185 +1,177 @@
-# D10 · 内置库与宿主嵌入 / CLI
+# D10 · 内置函数与 CLI
 
-> 前置知识：D5、D6。本篇讲"JS 世界之外的砖块"：内置函数怎么用 Kotlin 实现、宿主怎么嵌入引擎、
-> 以及命令行入口长什么样。
+> 前置知识：D5（VM）、D6（值模型）、D9（双后端）。
+>
+> 本篇拆解 `runtime/Intrinsics.kt`、`runtime/IntrinsicsExt.kt`、`runtime/KjsNamespace.kt` 与
+> `cli/Main.kt`：KJS 的 `Object/Array/JSON/Map/...` 这些"语言自带函数"是怎么接进引擎的，以及
+> 命令行与 REPL 如何驱动引擎。读完能理解"宿主功能如何零侵入地挂进 VM"。
 
-## 1. 内置函数 = JsNativeFn
+## 1. 核心机制：内置就是 `JsFunction.native`
 
-所有 `Object` / `Array` / `console` / `Math` 等内置，本质都是 `JsNativeFn`
-（`runtime/JsFunction.kt`）——用 Kotlin lambda 实现、直接跑、无字节码：
+所有内置函数都是 `JsFunction.native(name, arity, lambda)`（`D6 §5`）——一个 Kotlin lambda 包成 JS 函数。
+VM 的 `CALL`/`CALL_METHOD` 调用任何 `JsFunction` 时都走 `JsFunction.call`（`D5 §4`），**不区分用户函数
+还是宿主函数**（D5 §4 的 `invokeFast` 最终 `fn.call`）。所以"挂一个内置"= 创建 `native` 函数并设到
+全局对象或某原型上，无需改动编译器或 VM。
+
+两个统一的辅助（`Intrinsics.kt:22`）：
 
 ```kotlin
-30:50:engine/src/main/kotlin/io/kjs/runtime/JsFunction.kt
-class JsNativeFn(
-    val name: String,
-    val fn: (vm: Vm, args: List<Any?>, thisVal: Any?) -> Any?,
-) : JsFunction() {
-    override fun call(vm: Vm, args: List<Any?>, thisVal: Any?): Any? = fn(vm, args, thisVal)
+22:25:engine/src/main/kotlin/io/kjs/runtime/Intrinsics.kt
+private fun arg(args: List<Any?>, i: Int): Any? = if (i < args.size) args[i] else JsValues.UNDEFINED
+private fun defineFn(target: JsObject, name: String, arity: Int, fn: (Any?, List<Any?>) -> Any?) {
+    target.set(name, JsFunction.native(name, arity, fn))
 }
 ```
 
-`call` 直接进 Kotlin 函数，是性能热点（如 `Array.prototype.map`）。宿主/标准库作者只需写 Kotlin
-lambda，就能给 JS 暴露原生能力。
+`arg` 处理"参数不足补 `undefined"`（统一参数语义）；`defineFn` 把 lambda 挂到 `target` 的 `name` 上
+（原型或构造函数）。
 
-## 2. Intrinsics：标准库实现
+## 2. Intrinsics：M1 核心内置库
 
-`Intrinsics`（`runtime/Intrinsics.kt:1`）安装核心内置到 `Realm`：
+`Intrinsics.install`（`Intrinsics.kt:8`）按构造器分组接线，每个组做三件事：建原生构造器 → 设
+`prototype` 与 `constructor` 互指 → 在原型/全局上挂方法。涵盖 `Object/Function/Array/String/Number/
+Math/JSON/Error/console/全局量`。
+
+### 2.1 典型：Array.prototype 方法
+
+`installArray`（`Intrinsics.kt:100`）把 `push/pop/shift/unshift/slice/concat/join/indexOf/includes/
+reverse/map/filter/forEach/reduce/find/toString` 全挂到 `arrayProto`。例如 `map`（`Intrinsics.kt:170`）：
 
 ```kotlin
-1:40:engine/src/main/kotlin/io/kjs/runtime/Intrinsics.kt
-fun installIntrinsics(realm: Realm) {
-    val g = realm.globalObj
-    // 全局对象
-    g.set("globalThis", g)
-    g.set("Object", makeObjectCtor(realm))
-    g.set("Array", makeArrayCtor(realm))
-    g.set("Function", makeFunctionCtor(realm))
-    g.set("String", makeStringCtor(realm))
-    g.set("Number", makeNumberCtor(realm))
-    g.set("Boolean", makeBooleanCtor(realm))
-    g.set("Symbol", makeSymbolCtor(realm))
-    g.set("Error", makeErrorCtor(realm))
-    g.set("Math", makeMath(realm))
-    g.set("JSON", makeJson(realm))
-    g.set("console", makeConsole(realm))
-    // 原型方法
-    installObjectProto(realm.objectProto)
-    installArrayProto(realm.arrayProto)
-    installStringProto(realm.stringProto)
-    ...
+170:175:engine/src/main/kotlin/io/kjs/runtime/Intrinsics.kt
+defineFn(r.arrayProto, "map", 1) { self, args ->
+    val a = self as? JsArray ?: error("TypeError: not an array")
+    val fn = args.first() as JsFunction
+    val out = JsArray().apply { proto = r.arrayProto }
+    for (i in 0 until a.length) out.push(fn.call(JsValues.UNDEFINED, listOf(a.get(i.toString()), i.toDouble(), a)))
+    out
 }
 ```
 
-每个构造器/原型方法都是 `JsNativeFn`。示例——`Array.prototype.map`：
+注意回调以 `undefined` 作 `this`、按 ES 顺序传 `(v, i, arr)`，与 JS 语义一致。`push/pop` 维护 `length`
+（`Intrinsics.kt:114/117`）。
+
+### 2.2 JSON：自带解析器
+
+`JSON.parse` 用 Kotlin 手写的递归下降 `JsonParser`（`Intrinsics.kt:412`），`JSON.stringify` 用
+`jsonStringify`（`Intrinsics.kt:380`）递归序列化（`undefined`/`function` 跳过、`NaN/Infinity→null`）。不
+依赖外部 JSON 库，保证语义与 ES 一致。
+
+### 2.3 错误与 console
+
+`makeErrorCtor`（`Intrinsics.kt:456`）生产的 `Error/TypeError/...` 构造器在 `new` 时挂 `message`；`console`
+的 `log/info/warn/error/debug`（`Intrinsics.kt:480`）只是 `System.out/err.println` 的封装，统一 `toStr` 参数。
+
+### 2.4 全局量与 BigInt
+
+`installGlobals`（`Intrinsics.kt:494`）挂 `NaN/Infinity/isNaN/isFinite/parseInt/parseFloat` 以及
+`BigInt`（`Intrinsics.kt:507`）：把数字/字符串/布尔/BigInteger 强转成 `java.math.BigInteger`，非整数
+数字抛 `RangeError`——这是 `123n` 字面量与 `BigInt()` 的落地。
+
+## 3. IntrinsicsExt：ES2015+ 扩展库
+
+`IntrinsicsExt`（`IntrinsicsExt.kt:8`）是**第二层**，刻意与 `Intrinsics` 分离以保持核心可读（文件头注释）。
+它 `extend*` 既有原型并新增整组构造器：`Object.freeze/create/defineProperty/is`、`String.padStart/
+regex 方法`、`Array.some/every/flat/sort/from/of`、`RegExp`、`Date`、`Symbol`、`Map/Set`、`Promise`、
+`Proxy`、`Reflect`、`ArrayBuffer`、`TypedArray`、`DataView`。
+
+### 3.1 迭代协议支撑 for-of（关键连接）
+
+数组的 `for-of` 能力来自原型上的 `@@iterator`（`Intrinsics.kt:213`）返回一个实现了 ES 迭代协议的
+对象。生成器是 `makeJsIterator`（`IntrinsicsExt.kt:43`）：
 
 ```kotlin
-42:70:engine/src/main/kotlin/io/kjs/runtime/Intrinsics.kt
-fun installArrayProto(proto: JsObject) {
-    proto.set("map", JsNativeFn("map") { vm, args, thisVal ->
-        val arr = thisVal as JsArray
-        val cb = args[0] as JsFunction
-        val selfThis = if (args.size > 1) args[1] else Undefined
-        val out = JsArray()
-        for (i in 0 until arr.length) {
-            out.push(cb.call(vm, listOf(arr.get(i), i.toDouble(), arr), selfThis))
-        }
-        out
+43:52:engine/src/main/kotlin/io/kjs/runtime/IntrinsicsExt.kt
+internal fun makeJsIterator(r: Realm, it: Iterator<Any?>): JsObject {
+    val o = JsObject(r.objectProto); o.className = "Iterator"
+    o.set("next", JsFunction.native("next", 0) { _, _ ->
+        if (it.hasNext()) iterResult(r, it.next(), false)
+        else iterResult(r, JsValues.UNDEFINED, true)
     })
-    proto.set("forEach", ...)
-    proto.set("push", ...)
-    proto.set("filter", ...)
-    proto.set("reduce", ...)
+    o.set("@@iterator", JsFunction.native("@@iterator", 0) { self, _ -> self ?: JsValues.UNDEFINED })
+    return o
 }
 ```
 
-注意 `thisVal`：原型方法经 `CALL_METHOD` 拿到正确的 `this`（调用它的数组），这正是 D5 §3 的
-`CALL_METHOD` 约定落地的地方。
+它把 Kotlin `Iterator` 包成 `{ next() → {value, done} }` 对象。**VM 的 `for-of`（`D5 §15`）正是调用
+这个 `next()`**——于是 `for (x of arr)`、`Map`/`Set` 的遍历都走同一套协议。字符串/数组原型注册的
+`keys/values/entries` 也都用 `makeJsIterator`（`Intrinsics.kt:209`）。
 
-`console.log` 用 `println` + 自定义 `repr`，`Math.*` 调 Kotlin `kotlin.math`，
-`JSON.stringify/parse` 手写序列化/反序列化，全部走 `JsNativeFn`。
+### 3.2 Map / Set 的存储后端
 
-## 3. IntrinsicsExt：扩展内置
+`Map` 用 `MapHolder`（`IntrinsicsExt.kt:578`，内含 `LinkedHashMap`）作底层存储，`get/set/has/delete`
+直接转发；`entries/keys/values` 用 `makeJsIterator` 暴露迭代器。`Set` 同构（`SetHolder` + `LinkedHashSet`）。
+`size` 每次写后更新（`IntrinsicsExt.kt:538`）。
 
-`IntrinsicsExt`（`runtime/IntrinsicsExt.kt:1`）放**非核心**但仍内置的 API（如 `Reflect`、
-`Proxy` 部分、`Promise` 雏形、或项目特定的宿主 API）。与 `Intrinsics` 分离便于按需开启：
+### 3.3 Promise（同步最小实现）
 
-```kotlin
-1:30:engine/src/main/kotlin/io/kjs/runtime/IntrinsicsExt.kt
-fun installIntrinsicsExt(realm: Realm) {
-    realm.globalObj.set("Reflect", makeReflect(realm))
-    // 上次改动聚焦在这里：优化全局符号查找（配合 GlobalIc）
-    realm.globalObj.set("__kjs", makeHostApi(realm))
-}
-```
+`installPromise`（`IntrinsicsExt.kt:627`）用 `_state/_value/_onFulfilled/_onRejected` 字段模拟 Promise
+状态机，`then` 注册回调、`settle`（`IntrinsicsExt.kt:692`）在 resolve 时同步触发。这是**同步**实现
+（无微任务队列），能满足基本 `then` 链但与真实事件循环时序不同——属已知简化。
 
-> 本工作区中 `IntrinsicsExt.kt` 与 `GlobalIc.kt` 是最近改动的重点——前者暴露宿主 API，
-> 后者加速这些全局名的解析（见 D7 §5）。
+### 3.4 其它
 
-## 4. KjsNamespace：宿主命名空间
+- `RegExp`：包成 `JsObject` 带 `source/flags`，`toRegex`（`IntrinsicsExt.kt:234`）把 flags 映射到 Kotlin
+  `RegexOption`；`String.match/replace` 据此支持正则。
+- `Proxy`：直接 `JsProxy(target, handler)`（D6 §3），其余 trap 由 `JsObject` 转发。
+- `Date`/`Symbol`：轻量实现（`getFullYear` 等用 `Calendar`；`Symbol` 用 `__uniq__` 模拟唯一性）。
+- `ArrayBuffer`/`TypedArray`/`DataView`：在 `ByteArray` 上实现，`JsTypedArray` 的 `get/set` 覆盖把
+  下标路由到字节缓冲（D6 §3），V8 之外的 `LOAD_ELEM` 自动看到强类型值。
 
-`KjsNamespace`（`runtime/KjsNamespace.kt:1`）把"引擎能力"打包成宿主可调用的 Kotlin API，
-让嵌引擎的 App（如 `cat-video-*` 之外的脚本宿主）能：
+## 4. KjsNamespace：宿主如何扩展引擎（范例）
 
-- 注册自定义全局（`ns.expose("myApi", JsNativeFn{...})`）；
-- 读/写 JS 全局（`ns.get("x")`、`ns.set("x", 1.0)`）；
-- 调用 JS 函数并拿到返回值；
-- 注入 Java/Kotlin 对象给 JS 当原生值。
+`KjsNamespace.install`（`KjsNamespace.kt:16`）演示**嵌入者如何零侵入地把应用 API 暴露给 JS**。它挂一个
+`kjs` 全局对象，提供 `rand/ms/assert/repeat`：
 
-```kotlin
-1:40:engine/src/main/kotlin/io/kjs/runtime/KjsNamespace.kt
-class KjsNamespace(val engine: Engine) {
-    fun expose(name: String, fn: (Vm, List<Any?>, Any?) -> Any?) {
-        engine.realm.globalObj.set(name, JsNativeFn(name, fn))
-    }
-    fun eval(src: String): Any? = engine.eval(src)
-    fun callGlobal(fnName: String, vararg args: Any?): Any? { ... }
-}
-```
+- `assert`（`KjsNamespace.kt:31`）失败时用 `throw JsThrown(err)` 抛 JS 层异常（错误对象用 `errorProto`
+  构造），证明原生函数能正常抛错被 VM 的 `try/catch` 捕获（D5 §14）。
+- `repeat`（`KjsNamespace.kt:44`）接收 JS 函数作回调（`cb.call(...)`），证明原生函数可高阶调用 JS 函数。
 
-这是"把 KJS 当脚本引擎嵌入自家程序"的正式接口。
+文件头注释强调：**无需改编译器或 VM**——通用 `CALL_METHOD` 已能调用任何 `JsFunction.call` 实现。这是
+KJS 可嵌入性的核心。
 
-## 5. CLI / REPL（cli/Main.kt）
+## 5. CLI / REPL（Main.kt）
 
-`Main`（`cli/src/main/kotlin/io/kjs/cli/Main.kt:1`）是命令行入口：
+`cli/Main.kt` 是极简入口，演示如何驱动 `Engine`：
 
 ```kotlin
-1:50:cli/src/main/kotlin/io/kjs/cli/Main.kt
+15:26:engine/src/main/kotlin/io/kjs/cli/Main.kt
 fun main(args: Array<String>) {
-    val engine = Engine(trace = args.contains("--trace"))
+    var trace = false
+    val rest = mutableListOf<String>()
+    for (a in args) if (a == "--trace") trace = true else rest += a
+    val engine = Engine(trace = trace)
     when {
-        args.contains("-e") -> {            // 内联代码
-            val code = args[args.indexOf("-e") + 1]
-            println(repr(engine.eval(code)))
-        }
-        args.contains("--trace") -> runFile(engine, firstFile(args), trace = true)
-        args.isEmpty() -> repl(engine)       // 进入 REPL
-        else -> runFile(engine, args.last()) // 运行文件
-    }
-}
-fun repl(engine: Engine) {
-    while (true) {
-        print("kjs> "); val line = readLine() ?: break
-        try { println(repr(engine.eval(line))) }
-        catch (e: Throwable) { println("Error: ${e.message}") }
+        rest.isEmpty() -> repl(engine)
+        rest[0] == "-e" && rest.size >= 2 -> runCode(engine, rest[1])
+        else -> runCode(engine, File(rest[0]).readText())
     }
 }
 ```
 
-- `-e 'code'`：执行内联代码并打印结果（用 `repr` 规范化输出）。
-- `--trace`：把 `Engine` 设成 trace 模式，运行同时打印 token/AST/字节码/VM 步骤（见 D0 §5）。
-- 无参：进入 REPL，逐行 `eval`，错误不退出。
-- 文件路径：读文件 `eval`，等价于 `node script.js`。
+- `kjs` → `repl`（交互式，`.exit` 退出，`readlnOrNull` 逐行 `engine.eval` 并打印）。
+- `kjs script.js` → 读文件执行。
+- `kjs -e 'code'` → 执行内联代码。
+- `--trace` → `Engine(trace=true)`，把词法/语法/编译/VM 各阶段旁白打印（D0 §4 的 `Tracer`）。
+- `runCode`/`repl` 都捕获 `JsThrown` 打印 `"Uncaught ..."`，与 `Engine.evalToString` 一致（`D0 §4`）。
 
-`Engine` 的 `trace` 开关驱动 `Tracer`（`Engine.kt:38` 注入 `vm.tracer`）；
-`--trace` 让 `eval` 内部每个编译阶段都回调 `Tracer`，输出到 stdout。
+## 6. 设计取舍
 
-## 6. 宿主嵌入示例
+- **内置 = native JsFunction**：统一走 `JsFunction.call`，VM 无需特判，扩展内置零侵入。
+- **两层库分离**：`Intrinsics`（M1 核心）与 `IntrinsicsExt`（ES2015+）分开，核心保持可读。
+- **迭代协议统一 makeJsIterator**：数组/`Map`/`Set`/字符串共用一套 `{next}` 包装，`for-of` 一处实现。
+- **Promise 同步化**：用状态字段模拟，省微任务队列，满足基本链但时序非标准（已知简化）。
+- **CLI 极简**：`--trace` 直接接 `Engine` 的 `Tracer`，是学习内部运行的最佳入口。
 
-```kotlin
-val engine = Engine()
-engine.realm.globalObj.set("greet",
-    JsNativeFn("greet") { _, args, _ -> "hi ${args[0]}" })
-val r = engine.eval("greet('world')")   // "hi world"
-// 或用 KjsNamespace 更结构化
-val ns = KjsNamespace(engine)
-ns.expose("add") { _, a, _ -> (a[0] as Double) + (a[1] as Double) }
-println(engine.eval("add(2,3)"))         // 5.0
-```
+## 7. 常见坑
 
-## 7. 设计取舍
-
-- **标准库用 Kotlin lambda 而非 JS 实现**：`map`/`filter` 等热路径直接走 Kotlin，避免自举解释开销。
-- **Intrinsics / IntrinsicsExt 分离**：核心与扩展解耦，可按平台裁剪（如浏览器无 `console` 可省）。
-- **KjsNamespace 作为嵌入面**：把"暴露 API / 读全局 / 调函数"收敛到一个类，宿主无需碰 `Realm` 内部。
-- **CLI 复用 Engine**：REPL 与文件运行共用同一 `eval`，行为一致。
-
-## 8. 常见坑
-
-- **`thisVal` 在原生方法里可能是 `undefined`**：如 `const m = arr.map; m(arr)` 直接调会丢 `this`，
-  `installArrayProto` 里必须处理 `thisVal is JsArray` 否则抛类型错误——JS 语义要求如此。
-- **原生函数返回值必须是 JS 值**：Kotlin 的 `Int`/`Long` 不能直接上栈，需转 `Double`；
-  `Unit` 应转 `Undefined`，否则 VM 栈上出现非 `Any?` JS 值导致后续强制崩溃。
-- **全局名与 IC**：新增全局（`IntrinsicsExt.expose`）会被 `GlobalIc` 缓存；同一 `Realm` 内改名/删名
-  需让 IC 失效（通常重新 `new Engine` 最简单）。
-- **`repr` 递归深度**：`console.log` 打印嵌套对象需限制深度/环检测，否则栈溢出。
-- **CLI 的 `-e` 与文件二义**：`-e` 后的参数才算代码，其余当作文件名——顺序敏感，需小心解析。
+- **`this` 绑定**：原型方法回调应以 `undefined` 作 `this`（如 `map` 的 `fn.call(UNDEFINED, ...)`），
+  否则数组方法里 `this` 指向错误。
+- **参数不足**：所有内置必须用 `arg(args, i)` 取值，否则 `args[i]` 越界抛 `IndexOutOfBounds`。
+- **`length` 维护**：`push/pop/shift` 必须同步更新 `JsArray.length`，否则 `for-of`/`map` 遍历越界。
+- **`NaN/Infinity` 在 JSON**：`JSON.stringify` 把 `NaN/Infinity` 写成 `"null"`，与 ES 一致，别误当数字。
+- **Promise 时序**：当前是同步 resolve，不要依赖 `then` 的异步（微任务）语义。
+- **原生抛错用 `JsThrown`**：宿主函数要抛 JS 异常必须 `throw JsThrown(value)`，否则 VM 的 `catch
+  (JsThrown)`（D5 §14）捕获不到，变成宿主崩溃。
+- **`makeJsIterator` 的 `@@iterator` 自引用**：迭代器对象自身也要注册 `@@iterator`（`IntrinsicsExt.kt:50`），
+  否则 `for (x of iterator)` 不工作。

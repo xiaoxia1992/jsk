@@ -1,185 +1,208 @@
-# D4 · AST → 字节码编译器
+# D4 · 编译器 Compiler（AST → Bytecode）
 
-> 前置知识：D2、D3。本篇讲"树如何变成三条车道"，是引擎里最考验工程细节的模块。
+> 前置知识：D2（AST）、D3（字节码）。
+>
+> 本篇拆解 `ir/Compiler.kt`：如何把 AST 编译成 `Bytecode`。核心是四件事——**作用域/槽位分配、
+> Upvalue 闭包解析、变量提升、跳转修补**，外加 class 解语法糖。读完能理解"结构化的 AST 如何变成
+> VM（D5）可直接执行的扁平指令流"。
 
-## 1. 入口与结构
+## 1. 编译器结构：每个函数一个 Compiler
 
-`Compiler`（`ir/Compiler.kt:20`）是递归编译 AST 的核心。入口 `compileProgram`：
+`Compiler`（`Compiler.kt:23`）不全局单例，而是**每个函数一次 new**（含顶层 program）：
 
 ```kotlin
-20:45:engine/src/main/kotlin/io/kjs/ir/Compiler.kt
-object Compiler {
-    fun compileProgram(program: Program, sourceName: String): Bytecode {
-        val bc = Bytecode(sourceName)
-        val c = Compiler(bc, parent = null, isFunction = false)
-        c.compileStmtList(program.body)   // 顶层语句
-        bc.emit(Opcode.RETURN_UNDEF)
-        bc.freeze()
-        return bc
+23:39:engine/src/main/kotlin/io/kjs/ir/Compiler.kt
+class Compiler(
+    val parent: Compiler?,                 // 外层函数编译器（构成作用域链）
+    val bytecode: Bytecode,                // 本函数的字节码产物
+    val isArrow: Boolean,                  // 是否箭头函数（this 沿用外层）
+    source: String,
+) {
+    data class Scope(val kind: String, val locals: LinkedHashMap<String, Int>, val nextSlot: Int)
+    private val scopeStack = ArrayDeque<Scope>()   // 块级作用域栈
+    private val upvalues = mutableListOf<Upvalue>() // 本函数捕获的 upvalue 列表
+    private val scopeDepth get() = scopeStack.size
+    private val strings get() = bytecode.strings
+    // ...
+}
+```
+
+- **`parent` 链**：内层函数能通过 `parent` 一路向上找外围的局部变量（用于闭包与 `upvalue`）。
+- **`Scope`**（`Compiler.kt:28`）：一个块级作用域 = 局部名 → 槽号映射 + 下一空闲槽 `nextSlot`。
+- **`upvalues`**：本函数需从外层捕获的变量清单（`Upvalue` 记录来源是"外层局部槽"还是"更外层 upvalue"）。
+
+`compileProgram`（`Compiler.kt:43`）是入口：hoist → 编译顶层语句 → `HALT` → `freeze` → 返回 bytecode。
+`compileFunction`（`Compiler.kt:158`）对每个函数创建子 `Compiler`，预留参数槽并编译函数体。
+
+## 2. 作用域与槽位分配（核心原理一）
+
+局部变量不按名字引用，而是**编译期分配一个整数"槽号"**，运行时就是 `Frame.locals[槽]`（D5 §5）。
+
+```kotlin
+57:87:engine/src/main/kotlin/io/kjs/ir/Compiler.kt
+fun enterBlock(kind: String) { scopeStack.addLast(Scope(kind, LinkedHashMap(), nextSlotLocal())) }
+fun leaveBlock() { val s = scopeStack.removeLast(); for ((_, slot) in s.locals) freeSlot(slot); emit(POP_BLOCK) }
+fun declareLocal(name: String): Int {
+    // 块作用域(let/const)在最近一层声明；函数作用域(var/函数声明)提升到函数顶部
+    val scope = if (isBlockScoped) scopeStack.last() else scopeStack.first()
+    return scope.locals.getOrPut(name) { scope.nextSlot++ }  // 新名字才占新槽
+}
+fun resolveLocal(name: String): Int? {
+    // 从最近块向上找，但遇到"函数作用域"边界(非 block)即停（不越函数）
+    for (i in scopeStack.indices.reversed())
+        if (scopeStack[i].locals.containsKey(name)) return scopeStack[i].locals[name]
+    return null
+}
+```
+
+要点：
+- **`declareLocal`**：`let/const`（`isBlockScoped`）放进当前块；`var`/函数声明**提升到函数顶部**
+  （`scopeStack.first()`），这正是 JS "var 提升" 与 "块级 let 不跨块" 的实现。
+- **`resolveLocal`** 遇函数作用域边界停止——保证 `var x` 在函数内任何位置都解析到同一顶层槽（提升）。
+- **`freeSlot`**（`Compiler.kt:67`）：块退出时回收其局部槽，供后续块复用，控制 `localCount` 不膨胀。
+- `PUSH_BLOCK`/`POP_BLOCK`（D5 §2）是运行时块边界指令，配合 `leaveBlock` 的 `emit(POP_BLOCK)`。
+
+## 3. Upvalue 闭包解析（核心原理二）
+
+当内层函数引用了**外层函数**的局部变量，该变量要被捕获成 upvalue。`resolveUpvalue`
+（`Compiler.kt:90`）沿 `parent` 链解析：
+
+```kotlin
+90:103:engine/src/main/kotlin/io/kjs/ir/Compiler.kt
+fun resolveUpvalue(name: String): Int? {
+    val p = parent ?: return null
+    val local = p.resolveLocal(name)            // 外层函数自己的局部槽？
+    if (local != null) {
+        val idx = p.addUpvalue(Upvalue(true, local))   // parentIsLocal = true
+        return upvalues.size.also { upvalues.add(Upvalue(false, idx)) }  // 本层引用外层 upvalue
+    }
+    val up = p.resolveUpvalue(name) ?: return null     // 递归: 更外层
+    val idx = p.addUpvalue(Upvalue(false, up))          // 链式引用外层已闭包的 upvalue
+    return upvalues.size.also { upvalues.add(Upvalue(false, idx)) }
+}
+```
+
+于是 `upvalueInfo`（最终写入 `Bytecode.upvalueInfo`）记录每个 upvalue 的"来源"。VM 在
+`MAKE_CLOSURE` 时据此组装 `Upvalue[]` 盒子链（D5 §9）：`parentIsLocal` 的从本帧局部槽开/复用盒子，
+否则引更外层的 `Upvalue`。**这正是 ES 闭包"捕获变量而非值"的实现**。
+
+## 4. 变量提升（核心原理三）
+
+`hoisting`（`Compiler.kt:107`）在编译每个函数体**之前**先扫一遍声明：
+
+```kotlin
+107:156:engine/src/main/kotlin/io/kjs/ir/Compiler.kt
+private fun hoisting(node: Node) {
+    when (node) {
+        is VarDecl -> for (d in node.decls) {
+            val slot = declareLocal(d.name!!, isBlockScoped = node.kind != "var")  // var 提到函数顶
+            if (d.init != null) { compileExpr(d.init); emit(STORE_LOCAL, slot) }  // 有初值则在顶部求值
+        }
+        is FunctionDecl -> {
+            val fnBc = compileFunction(node, ...)
+            val slot = declareLocal(node.name, isBlockScoped = false)
+            emit(MAKE_CLOSURE, fnIdx(fnBc)); emit(STORE_LOCAL, slot)   // 函数声明整体提升
+        }
+        is Block -> node.body.forEach { hoisting(it) }
+        is If -> { hoisting(node.cons); node.alt?.let { hoisting(it) } }
+        // while/for 等同理递归
     }
 }
 ```
 
-编译器对象携带：当前 `Bytecode`、父编译器 `parent`、作用域 `scope`（槽位表）、`loopStack`
-（break/continue 目标）、`upvalRequests`（需要向父作用域借的 upvalue）。
+效果对应 JS 语义：
+- `var x` / 函数声明被提升到函数顶部（用 `scopeStack.first()` 的槽）。
+- 函数声明**整体提升且可调用**（先编译子函数、发射 `MAKE_CLOSURE`），所以"先调用后声明"的函数可用。
+- `let/const` 通过"块级 `Scope` + `PUSH_BLOCK/POP_BLOCK`"实现 TDZ（运行时访问未初始化块变量由
+  块环境变量管理，D6 §5）。
 
-## 2. 作用域与槽分配
+## 5. 跳转修补（核心原理四）
 
-每个函数/块建立一个 `Scope`，变量名 → 局部槽位 `a`：
-
-```mermaid
-flowchart TD
-    G[全局 Scope] -->|function f| SF[f 的 Scope: a:0,b:1]
-    SF -->|块级 let| SB[块 Scope: 临时槽 c:2]
-    SF -->|内嵌 arrow| SA[arrow Scope: 引用 f 的槽]
-```
-
-- **`var` / 函数声明**：提升到所在**函数作用域**顶部，槽位在函数开始处统一分配。
-- **`let` / `const`**：块级作用域，进入块 `PUSH_SCOPE`，离开 `POP_SCOPE`；槽位在该块内分配。
-- **参数**：按声明顺序占前 N 个槽（`arity`）。
-
-`resolveLocal(name)`：从内层 Scope 向外找，返回槽位；找不到则可能是 **upvalue**（见下）
-或全局变量（`LOAD_GLOBAL`）。
-
-## 3. 闭包与 Upvalue（核心）
-
-当内层函数引用了外层函数的局部变量，该变量被"捕获"。KJS 用 **`Upvalue` 盒子**实现真正的闭包：
+`compileIf/compileWhile/compileForC`（`Compiler.kt:672`）用 `emit(JF/JMP, 0)` 占位 + `patchA` 回填。
+以 `if` 为例：
 
 ```kotlin
-60:90:engine/src/main/kotlin/io/kjs/ir/Compiler.kt
-// 父帧持有真实槽，捕获变量被提升成共享 Upvalue 引用
-private fun capture(name: String): Int {
-    // 在本作用域找槽
-    val slot = scope.find(name)
-    // 请求父编译器把该槽"提升"为 Upvalue
-    val up = parent!!.requestUpvalue(slot)
-    // 本地记录：引用 Upvalue 而非直接槽
-    return addUpval(up)
+674:690:engine/src/main/kotlin/io/kjs/ir/Compiler.kt
+fun compileIf(node: If) {
+    val jfAt = emitPlaceholder(JF)        // 占位: 条件假则跳到 else/end
+    compileStmt(node.cons)
+    if (node.alt != null) {
+        val jEnd = emitPlaceholder(JMP)   // then 之后跳到 end
+        patchA(jfAt, codeSize())          // 回填: 假跳转到 else 起点
+        compileStmt(node.alt)
+        patchA(jEnd, codeSize())          // 回填: 跳到 end
+    } else patchA(jfAt, codeSize())
 }
 ```
 
-`requestUpvalue` 让**父帧**把局部变量搬到 `Upvalue` 对象（一个 `Ref` 盒子），父帧的所有读写
-都改走这个盒子；内层闭包通过同一个 `Upvalue` 引用读写——于是闭包内外看到的是**同一份内存**
-（这正是 JS 闭包语义，也是 D5 `CALL` 约定里 upvalue 数组的来源）。
+`emitPlaceholder(JF)` = `emit(JF,0)` 后返回 `code.size-1`（`Compiler.kt:46`）。**关键纪律**：占位
+后必须立即记录 `at`，因为随后 `emit` 会增长 `code.size`，再取 `code.size-1` 就指向错指令。`break/
+continue` 通过 `breakPatches/continuePatches`（`Compiler.kt:154`）在循环结束后统一回填（D5 的分发
+循环据此实现循环）。`for-of`/`for-in` 的迭代协议指令（`FOR_OF_INIT/NEXT` 等）也在这发射（D5 §15）。
 
-`MAKE_CLOSURE b a`：`b`=functions 池里子字节码下标，`a`=需要绑定的 upvalue 个数，紧跟着
-`LOAD_*` 把每个 upvalue 装载进栈，再由 VM 组装成 `JsClosure`。
+## 6. class 解语法糖（核心原理五）
 
-## 4. Hoisting（变量提升）
+VM 没有原生 class，`compileClass`（`Compiler.kt:485`）把 `class` 解成"构造函数 + 原型赋值"：
 
-JS 的 `var`/函数声明会被"提升"到作用域顶。KJS 在编译函数体**开头**先扫一遍声明：
+- 构造 `ClassDecl.constructor`（或默认空构造）编译成普通 `FunctionExpr`。
+- 遍历 `members`：实例方法挂到 `prototype`，静态方法挂到构造函数对象本身（`emit(STORE_PROP,
+  strIdx("prototype"))` 等）。`get/set` 访问器用 `Object.defineProperty` 语义发射。
+- 继承（`superClass`）：在构造函数体顶部插入 `superClass.prototype` 作为新实例原型的设置，并把
+  `super` 引用解析到外层 `this` 与原型链（通过 `SuperMember/SuperCall` AST 节点编译成相应属性访问）。
+- 最终发射 `MAKE_CLASS_INSTANCE` 组合出完整类对象，交给调用处 `STORE_LOCAL` 等。
 
-```kotlin
-100:120:engine/src/main/kotlin/io/kjs/ir/Compiler.kt
-// 第一遍：分配 var/函数声明的槽位（hoist）
-for (s in body) when (s) {
-    is VarDecl -> { for (d in s.decls) scope.alloc(d.name) ; if (s.kind=="var") emit init }
-    is FunctionDecl -> { scope.alloc(s.name); emit MAKE_CLOSURE; STORE_LOCAL }
-}
-// 第二遍：真正编译语句体（此时变量槽已就绪）
-for (s in body) compileStmt(s)
+> 解糖让 class 完全落在"函数 + 原型 + 属性"这套已实现的原语上，VM 无需为 class 新增任何 opcode。
+
+## 7. 参数前导（prelude）：默认值 / 解构 / rest
+
+`compileFunction`（`Compiler.kt:158`）预留参数槽后，按参数列表发射**前导代码**：
+
+- 有 `= default`：`JT(b)` 检查该槽是否为 `undefined`，是则求值默认值 `STORE_LOCAL`。
+- 解构参数（如 `function f({a, b})`）：先 `LOAD_LOCAL` 槽 → `expandDestructure`（`Compiler.kt:290`）
+  把模式编译成一系列 `LOAD_PROP` + `STORE_LOCAL` 到新槽，最后丢弃原参数槽。
+- `rest`（`...args`）：`emit(MAKE_ARRAY, 0)` 收集剩余实参到最后一槽。
+
+这与 D5 §4 "参数逆序收进 `argsArr` → 绑进 `locals[0..paramCount-1]`" 衔接：前导代码在参数已入槽后
+做二次加工。
+
+## 8. 标识符加载：四路回退
+
+`emitLoadIdent`（`Compiler.kt:931`）决定一个名字 `x` 编译成哪条指令，回退链：
+
+```
+1. 本函数局部槽 resolveLocal(x) != null  → LOAD_LOCAL
+2. 外层 upvalue resolveUpvalue(x) != null → LOAD_UPVAL
+3. x == "arguments"                        → LOAD_ARGUMENTS
+4. 否则                                    → LOAD_GLOBAL（运行时再查 Environment 链, D5 §11）
 ```
 
-> 函数声明提升优先级高于 `var`，且同名 `var` 不重复分配槽——KJS 用 `scope.alloc` 幂等处理。
+`emitStoreIdent`（`Compiler.kt:940`）对称：`STORE_LOCAL / STORE_UPVAL / STORE_GLOBAL`。赋值到未声明
+全局名时 `STORE_GLOBAL` 走 `setOrDeclareGlobal`（D5 §11）。
 
-## 5. 控制流跳转修补（核心难点）
+## 9. 调用发射
 
-`if/while/for/break/continue` 都靠"先 emit `JMP` 占位、回头回填目标"实现。
+`compileCall`（`Compiler.kt:1124`）区分：
+- `CALL`：先编译 callee，再按顺序编译各实参（参数入栈顺序 = `arg0..argN-1`，D5 §4）。
+- `CALL_METHOD`（`obj.method(...)`）：先编译 `obj` 入栈，再编译实参，最后发射（VM 弹出 `obj` 作 `this`）。
+- `NEW_OP`：`new Ctor(...)`，编译 `ctor` + 实参后发射（`this` = 新实例，D5 §4）。
+- `SPREAD`：`f(...arr)` 把数组展开成多个实参，发射 `SPREAD` + `emitBuildArgsArray`（`Compiler.kt:1209`）
+  在运行时集合成 `argsArr`。
 
-**if**：
+## 10. 设计取舍
 
-```mermaid
-flowchart TD
-    C[编译 cond] --> J[emit JMP_IF_FALSE patch]
-    J --> T[then 块]
-    T --> J2[emit JMP end]
-    J2 --> E[end: 回填 patch 与 JMP 目标]
-```
+- **每函数一 Compiler + parent 链**：闭包/作用域天然落在编译器结构上，Upvalue 沿链解析。
+- **槽号代替名字**：运行时零哈希查找（`Frame.locals[slot]`），是 VM 快的关键之一。
+- **提升 + 块级作用域分离**：`var`/函数声明提函数顶，`let/const` 用块 Scope 实现 TDZ。
+- **跳转占位 + 补丁**：扁平指令流无标签，跳转目标编译期未知，用占位回填解决。
+- **class 全解糖**：不污染 VM opcode 集，class = 函数+原型+属性。
+- **标识符四级回退**：局部 → upvalue → arguments → 全局，覆盖 JS 全部名称解析路径。
 
-```kotlin
-150:175:engine/src/main/kotlin/io/kjs/ir/Compiler.kt
-private fun compileIf(node: IfStmt) {
-    compileExpr(node.cond)
-    val elsePatch = emit(Opcode.JMP_IF_FALSE, b = 0)   // 占位
-    compileStmt(node.then)
-    if (node.els != null) {
-        val endPatch = emit(Opcode.JMP, b = 0)         // 跳过 else
-        patch(elsePatch, bc.countA)                    // else 起始
-        compileStmt(node.els)
-        patch(endPatch, bc.countA)                     // 结束
-    } else {
-        patch(elsePatch, bc.countA)
-    }
-}
-```
+## 11. 常见坑
 
-`loopStack` 记录当前循环的 `continueTarget` / `breakTarget`，`break`/`continue` 编译成
-`JMP breakTarget`/`JMP continueTarget`，循环体编译完后统一 `patch`。
-
-**for**：`for(init; cond; update)` 展开成
-`init; loop: cond?; JMP_IF_FALSE end; body; continue: update; JMP loop; end:`。
-`for-in`/`for-of` 用 `ITER_INIT` / `ITER_NEXT b` / `ITER_JUMP b` 三件套（见 D5 迭代协议）。
-
-## 6. 表达式编译（后序）
-
-表达式编译成**后序**字节码——操作数先入栈，运算符最后消费：
-
-```kotlin
-200:220:engine/src/main/kotlin/io/kjs/ir/Compiler.kt
-private fun compileExpr(e: Expr) = when (e) {
-    is BinaryExpr -> {
-        compileExpr(e.left); compileExpr(e.right)
-        emit(opcodeForBin(e.op))     // ADD / SUB / EQ ...
-    }
-    is CallExpr -> {
-        compileExpr(e.callee)
-        for (a in e.args) compileExpr(a)   // 参数逆序/顺序入栈
-        emit(Opcode.CALL, a = e.args.size, b = 0)
-    }
-    is ArrowFnExpr -> compileFunction(e.params, e.body, isArrow = true)
-    is MemberExpr -> {
-        compileExpr(e.obj)
-        if (e.computed) compileExpr(e.prop) else emitStr(e.prop)  // 属性名
-        emit(Opcode.LOAD_PROP, a = addPropCache())   // a = IC 槽
-    }
-}
-```
-
-> 关键点：`MemberExpr` 的 `LOAD_PROP a` 在编译期就分配好 **IC 槽**（`addPropCache()`），
-> 运行时该槽缓存"对象的隐藏类 → 属性偏移"，命中即跳过原型链查找（D7）。
-
-## 7. class desugar
-
-`class A extends B { ... }` 不引入新 opcode，而是 desugar 成原生语义：
-
-- `MAKE_CLOSURE` 编译构造函数；
-- `extends`：先 `compileExpr(superClass)` 压栈，再用 `Env.setProto` /
-  `Object.setPrototypeOf` 把子类 prototype 链接到父类 prototype；
-- `super` 调用：编译成带特殊 `this` 绑定的 `CALL`（`SUPER_CALL` 思路，KJS 用 `LOAD_THIS` +
-  `CALL_METHOD` 到父类方法）；
-- 静态方法挂到类对象自身，实例方法挂到 `prototype`。
-
-## 8. 解构绑定 desugar
-
-`[a, b] = rhs` / `({x, y} = rhs)` 在编译期**拆成逐元素**绑定：先把 `rhs` 编译入栈（或一个临时
-局部），再对每个模式元素生成 `LOAD_PROP`(取 `0`/`1`/`x`/`y`) → `STORE_LOCAL`。"剩余元素"
-`[a, ...rest]` 用 `ITER_INIT/NEXT` 收集。
-
-`const {a, b} = obj` 同理：每个键 `a`/`b` 生成 `LOAD_PROP a`（走 IC）→ `STORE_LOCAL`。
-
-## 9. 设计取舍
-
-- **两遍扫描（hoist + body）**：比"一遍 scan"简单且正确，代价是一次函数体遍历两次。
-- **后序字节码**：与栈式 VM 天然契合，VM 无需 AST 即可求值。
-- **Upvalue 延迟捕获**：只有真正被内层引用时才 `requestUpvalue`，无闭包的函数零开销。
-
-## 10. 常见坑
-
-- **跳转未回填**：`patch` 漏掉 → VM 跳到错误 `pc`。（最常发生于嵌套 try/finally，见下。）
-- **break 跨越函数**：`break` 只能跳出循环，不能跳出函数；编译器在循环外压栈、循环内弹栈，
-  若 lambda 里写 `break` 会被错误捕获到外层循环——KJS 用 `loopStack` 的"是否在同一函数帧"
-  校验。
-- **for-of 的迭代器协议**：`ITER_NEXT b` 的 `b` 是"取下一个"的回调入口，必须和 `ITER_INIT` 配对，
-  否则栈上会残留未关闭的迭代器。
-- **`PUSH_SCOPE/POP_SCOPE` 配对**：块级 `let` 在异常路径也必须 `POP_SCOPE`，否则后续 `STORE_LOCAL`
-  槽位错乱——KJS 在 try/finally 的 normal/throw 两段都补 `POP_SCOPE`。
+- **补丁点记录时机**：占位 `emit` 后必须立即存 `at`，否则 `code.size-1` 指错（D3 §8）。
+- **`var` 提升边界**：`resolveLocal` 须在函数作用域边界停止，否则跨函数共享槽号。
+- **Upvalue 链式**：`parentIsLocal=false` 必须引"外层已闭包 upvalue"而非重新开盒，否则多层闭包
+  捕获不一致（D5 §9）。
+- **块退出回收槽**：`leaveBlock` 须 `freeSlot`，否则嵌套块槽号无限增长、且 TDZ 名冲突。
+- **class 继承原型顺序**：`superClass.prototype` 设置必须在实例属性赋值前，否则覆盖错序。
+- **rest 参数与前导**：解构/rest 前导须在"参数已绑槽"之后，且 `localCount` 要覆盖临时槽。
