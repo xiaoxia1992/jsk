@@ -3,13 +3,28 @@
 > 前置知识：D0（管线概览）。
 >
 > 本篇拆解 `lex/Lexer.kt`：Token 模型、`/` 除号/正则歧义、数字/字符串/模板的扫描要点，以及
-> 标点歧义消解。读完能理解"字符流如何被正确切分成 Token 流"。
+> 标点歧义消解。读完能理解"字符流如何被正确切分成 Token 流"，并能在改动词法器时预判会破坏什么。
+>
+> 词法分析（Lexing）是把"人写的一段字符序列"转换成"有类型的、带位置的符号序列"的第一道关卡。
+> 它本身不做语法判断（不关心括号是否配对、语句是否合法），只负责：① 把连续字符切成最小有意义的
+> 词（token）；② 给字面量预求值；③ 在 JS 特有的歧义处（最典型是 `/`）做"上下文敏感"的消歧。
 
 ## 1. Token 模型
 
-`TokenType`（`Lexer.kt:3`）把 JS 词法分为五类：字面量（`NUMBER/BIGINT/STRING/TEMPLATE_STRING/
-REGEX/IDENT/TRUE/FALSE/NULL/UNDEFINED`）、关键字（`VAR/LET/.../CLASS/...`）、标点、运算符、
-以及 `EOF`。
+`TokenType`（`Lexer.kt:3`）把 JS 词法分为四类：字面量、关键字、标点、运算符，外加哨兵 `EOF`。
+完整清单（注意 KJS 支持到 ES2015 实用子集）：
+
+- **字面量**：`NUMBER`、`BIGINT`、`STRING`、`TEMPLATE_STRING`、`REGEX`、`IDENT`、
+  `TRUE`、`FALSE`、`NULL`、`UNDEFINED`。
+- **关键字**：`VAR/LET/CONST`、`FUNCTION/RETURN`、`IF/ELSE/WHILE/DO/FOR/BREAK/CONTINUE`、
+  `TRY/CATCH/FINALLY/THROW`、`NEW/DELETE/TYPEOF/INSTANCEOF/IN/VOID`、`THIS`、
+  `CLASS/EXTENDS/SUPER`、`IMPORT/EXPORT/DEFAULT/OF`。
+- **标点**：`LPAREN/RPAREN/LBRACE/RBRACE/LBRACK/RBRACK`、`COMMA/SEMI/COLON/DOT/ELLIPSIS/
+  ARROW/QUESTION`。
+- **运算符**：赋值族（`ASSIGN/PLUS_ASSIGN/.../USHR_ASSIGN`）、算术（`PLUS/MINUS/STAR/SLASH/
+  PERCENT/POW/INC/DEC`）、比较（`EQ/NEQ/SEQ/SNEQ/LT/LE/GT/GE`）、逻辑（`AND/OR/NOT/NULLISH`）、
+  位运算（`BITAND/BITOR/BITXOR/BITNOT/SHL/SHR/USHR`）。
+- **特殊**：`EOF`（哨兵，表示流结束）。
 
 `Token`（`Lexer.kt:33`）是值类，带 `type`、`value`（原始文本）、`line/col`（用于报错定位），
 外加 `numberValue: Double` 和 `bigIntValue: BigInteger?`——**数字在词法阶段就直接算成值**，
@@ -27,18 +42,50 @@ data class Token(
 )
 ```
 
-## 2. 主循环：`next()` 的状态机
+`numberValue`/`bigIntValue` 的设计意图：词法器是唯一需要把 `"123"` 解析成数字的地方；Parser、
+Compiler 直接 `token.numberValue` 即可，省去每层重复 `toDouble()`。`LexError`（`Lexer.kt:42`）
+继承 `RuntimeException`，携带 `line/col`，让"未闭合字符串""非法字符"等错误能精确报告位置。
 
-`Lexer`（`Lexer.kt:44`）持有 `pos/line/col`，以及一个**关键状态 `prevType`**（`Lexer.kt:49`）——
-它记录上一个"有效 token"的类型，是后面消解 `/` 歧义的基础。`tokenize`（`Lexer.kt:70`）就是
-不断 `next()` 直到 `EOF`：
+## 2. 词法器架构：光标与状态
+
+`Lexer`（`Lexer.kt:44`）的核心是一只"光标"加一个轻量回溯状态：
+
+- `pos/line/col`：当前字符位置与行列号。
+- 关键状态 `prevType`（`Lexer.kt:49`）：记录上一个"有效 token"的类型，是后面消解 `/` 歧义的基础。
+- `keywords` 映射表（`Lexer.kt:51`）：`String → TokenType`，O(1) 判定保留字。
+
+`tokenize`（`Lexer.kt:70`）就是不断 `next()` 直到 `EOF`：
+
+```kotlin
+70:78:engine/src/main/kotlin/io/kjs/lex/Lexer.kt
+fun tokenize(): List<Token> {
+    val out = mutableListOf<Token>()
+    while (true) {
+        val t = next()
+        out.add(t)
+        if (t.type == TokenType.EOF) break
+    }
+    return out
+}
+```
+
+### 2.1 底层光标操作
+
+`peek(o)`（`Lexer.kt:80`）零开销前瞻第 `o` 个字符（越界返回 `'\u0000'`）；`advance`（`Lexer.kt:83`）
+消费当前字符并维护行列（遇 `\n` 行号+1、列归 1）；`match(c)`（`Lexer.kt:89`）是"前瞻并消费"的
+便捷封装，多字符运算符合并时大量使用。
+
+### 2.2 `next()` 的单点分发
+
+`next`（`Lexer.kt:112`）每次先 `skipWhitespaceAndComments`，再按首字符分派到对应扫描函数：
 
 ```kotlin
 112:125:engine/src/main/kotlin/io/kjs/lex/Lexer.kt
 private fun next(): Token {
     skipWhitespaceAndComments()
     if (pos >= source.length) return setPrev(Token(TokenType.EOF, "", line, col))
-    val startLine = line; val startCol = col
+    val startLine = line
+    val startCol = col
     val c = peek()
     return when {
         c.isDigit() || (c == '.' && peek(1).isDigit()) -> number(startLine, startCol)
@@ -51,16 +98,139 @@ private fun next(): Token {
 ```
 
 每个 `setPrev`（`Lexer.kt:127`）在返回 Token 前更新 `prevType`，使下次 `next` 能据此判断上下文。
-`peek(o)`/`advance`/`match`（`Lexer.kt:80`）是底层光标操作：`advance` 推进 `pos` 并维护行列，
-`match` 是"前瞻并消费"的便捷封装。
+**所有 token 类型在一个 `when` 里分流**，新增 token 类型只改这一处，符合"开放封闭"的最小改动面。
 
-## 3. 核心难点：`/` 是除号还是正则？
+## 3. 数字扫描（`Lexer.kt:132`）
 
-JS 里 `/` 既可能是除法（`a / b`），也可能是正则字面量（`/foo/g`）。光看字符无法区分——
-**必须知道"前一个 token"是否处于"表达式位置"**：
+数字扫描需处理四种子形态：十六进制、十进制（含小数）、科学计数、BigInt 后缀。算法要点：
+
+```kotlin
+132:166:engine/src/main/kotlin/io/kjs/lex/Lexer.kt   (节选)
+private fun number(l: Int, cc: Int): Token {
+    val sb = StringBuilder()
+    // ① 十六进制
+    if (peek() == '0' && (peek(1) == 'x' || peek(1) == 'X')) {
+        sb.append(advance()); sb.append(advance())
+        while (peek().let { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) sb.append(advance())
+        if (peek() == 'n') { /* → BigInteger(hex) */ return BIGINT }
+        return NUMBER(toDouble(parseLong(hex, 16)))
+    }
+    // ② 整数部分
+    while (peek().isDigit()) sb.append(advance())
+    // ③ 小数（仅当后面仍是数字，避免把 `1.` 当小数吃掉点号）
+    if (peek() == '.' && peek(1).isDigit()) { sb.append(advance()); while (peek().isDigit()) sb.append(advance()) }
+    else if (peek() == '.') sb.append(advance())   // 孤立的 '.'，留给上层当 DOT
+    // ④ 科学计数
+    if (peek() == 'e' || peek() == 'E') { sb.append(advance()); if (peek()=='+'||peek()=='-') sb.append(advance()); while (peek().isDigit()) sb.append(advance()) }
+    // ⑤ BigInt 后缀：仅整数字面量允许尾随 n（sb 里无 '.' 与 'e'）
+    if (peek() == 'n' && sb.none { it == '.' || it == 'e' || it == 'E' }) { /* → BigInteger */ return BIGINT }
+    return NUMBER(sb.toString().toDouble())
+}
+```
+
+设计细节与真实限制：
+
+- **十六进制**：吞掉 `0x` 后吃 hex 字符；若尾随 `n` 走 `BigInt`（`BigInteger(radix=16)`），否则
+  `Long.parseLong(hex,16).toDouble()`。注意 KJS **不支持 `0o`（八进制）与 `0b`（二进制）前缀**，
+  这是 M1 简化。
+- **小数边界**：`1.5` 的小数点后面必须是数字才吃；`1.` 这种孤立点号只吞点、不当小数，把 `.` 留给
+  上层当 `DOT`（这是 JS `1..toString()` 能成立的原因，也与 ECMA 文法一致）。
+- **科学计数**：`e/E` 后可带正负号与数字指数，`1e3`/`2.5E-2` 都覆盖。
+- **BigInt 后缀**：只有**整数字面量**允许尾随 `n`（`sb.none { '.' / 'e' }`），`1.0n` 非法。
+- 最终值直接存入 `Token.numberValue`（或 `bigIntValue`），Parser/Compiler 零重复解析。
+
+## 4. 字符串扫描（`Lexer.kt:168`）
+
+字符串扫描吃掉引号后逐字符处理转义，未闭合则抛 `LexError`：
+
+```kotlin
+168:204:engine/src/main/kotlin/io/kjs/lex/Lexer.kt   (节选)
+private fun string(quote: Char, l: Int, cc: Int): Token {
+    advance() // 吃开头引号
+    val sb = StringBuilder()
+    while (pos < source.length && peek() != quote) {
+        val ch = advance()
+        if (ch == '\\') {
+            val esc = advance()
+            sb.append(when (esc) {
+                'n' -> '\n'; 't' -> '\t'; 'r' -> '\r'
+                '\\' -> '\\'; '\'' -> '\''; '"' -> '"'; '`' -> '`'
+                '0' -> '\u0000'; 'b' -> '\b'; 'f' -> '\u000C'; 'v' -> '\u000B'
+                'x' -> ("" + advance() + advance()).toInt(16).toChar()        // \xHH
+                'u' -> if (peek() == '{') {                                    // \u{...} 变长码点
+                    advance(); val cp = buildString { while (peek() != '}') append(advance()) }.toInt(16)
+                    sb.appendCodePoint(cp); advance(); continue
+                } else { ("" + advance()+advance()+advance()+advance()).toInt(16).toChar() }  // \uHHHH
+                else -> esc
+            })
+        } else sb.append(ch)
+    }
+    if (pos >= source.length) throw LexError("Unterminated string", l, cc)
+    advance() // 吃结尾引号
+    return setPrev(Token(TokenType.STRING, sb.toString(), l, cc))
+}
+```
+
+转义处理要点：`\xHH`（两位十六进制）、`\uHHHH`（四位）、`\u{...}`（变长码点，用
+`appendCodePoint` 写 UTF-32）、`\0` 写成 NUL。**字符串不在此求值**（`${}` 仅在模板串里处理），
+原样存 `value`。`continue` 在 `u{...}` 分支里用于跳过后手写的 `advance()`，避免多吞一个字符。
+
+## 5. 模板字符串（`Lexer.kt:206`）
+
+反引号串整体作为一个 `TEMPLATE_STRING` 切出，**内部 `${...}` 保留原样**由 Parser 二次解析：
+
+```kotlin
+206:224:engine/src/main/kotlin/io/kjs/lex/Lexer.kt   (节选)
+private fun templateString(l: Int, cc: Int): Token {
+    advance() // 吃开头 `
+    val sb = StringBuilder()
+    var depth = 0                      // 插值表达式嵌套深度
+    while (pos < source.length) {
+        val ch = peek()
+        if (depth == 0 && ch == '`') break
+        if (ch == '\\' && pos + 1 < source.length) { sb.append(advance()); sb.append(advance()); continue }
+        if (ch == '$' && peek(1) == '{') { depth++; sb.append(advance()); sb.append(advance()); continue }
+        if (depth > 0 && ch == '}') { depth--; sb.append(advance()); continue }
+        if (depth > 0 && ch == '{') { depth++; sb.append(advance()); continue }
+        sb.append(advance())
+    }
+    if (pos >= source.length) throw LexError("Unterminated template", l, cc)
+    advance() // 吃结尾 `
+    return setPrev(Token(TokenType.TEMPLATE_STRING, sb.toString(), l, cc))
+}
+```
+
+`depth` 计数保证 `${ a ? ${b} : c }` 这类嵌套插值不会被提前的 `}` 截断。词法阶段只负责"切出反引号
+整体"，复杂度下沉到 Parser 的 `expandTemplate`，职责清晰、不污染词法（D2）。
+
+## 6. 标识符与关键字（`Lexer.kt:226`）
+
+`identOrKw` 吃 `[A-Za-z0-9_$]`，再用 `keywords` 映射表把保留字转成对应 `TokenType`，否则为
+`IDENT`：
+
+```kotlin
+226:232:engine/src/main/kotlin/io/kjs/lex/Lexer.kt
+private fun identOrKw(l: Int, cc: Int): Token {
+    val sb = StringBuilder()
+    while (peek().isLetterOrDigit() || peek() == '_' || peek() == '$') sb.append(advance())
+    val s = sb.toString()
+    val kw = keywords[s]
+    return setPrev(Token(kw ?: TokenType.IDENT, s, l, cc))
+}
+```
+
+**真实限制**：KJS 的标识符字符集是 ASCII 的 `[A-Za-z0-9_$]`，**不支持 Unicode 标识符**（如中文变量名
+`const 数 = 1` 会失败）。这是 M1 简化，符合 ES5.1 的 ASCII 子集取向；若要支持 ES2015 的全 Unicode
+标识符，需放宽 `isLetterOrDigit` 判定（并相应扩展关键字表）。
+
+## 7. 核心难点：`/` 是除号还是正则？
+
+JS 里 `/` 既可能是除法（`a / b`），也可能是正则字面量（`/foo/g`）。光看字符无法区分——**必须知道
+"前一个 token"是否处于"表达式位置"**：
 
 ```kotlin
 234:244:engine/src/main/kotlin/io/kjs/lex/Lexer.kt
+/** Regex starts only in expression context. */
 private fun canStartRegex(): Boolean {
     val p = prevType ?: return true
     return when (p) {
@@ -73,8 +243,17 @@ private fun canStartRegex(): Boolean {
 }
 ```
 
-原则：若上一个 token 是**值/标识符/右括号**（`a`、`3`、`)`、`]` …），说明 `/` 紧接在表达式后，
-那它一定是**除号**；否则（如关键字后、左括号后、运算符后）则是**正则起始**。
+判定表的语义（为何每类如此）：
+
+| 前一词法类型 | 处于表达式位置？ | `/` 含义 | 理由 |
+|---|---|---|---|
+| `IDENT` / `NUMBER` / `STRING` / `TEMPLATE_STRING` | 是 | 除号 | 这些值后面接 `/` 必然是二元除法 |
+| `RPAREN` / `RBRACK` | 是 | 除号 | `)`/`]` 闭包后通常是表达式末尾，如 `(a+b)/c`、`arr[0]/2` |
+| `TRUE`/`FALSE`/`NULL`/`UNDEFINED`/`THIS` | 是 | 除号 | 字面量/关键字值后面接 `/` 是除法 |
+| `INC`/`DEC` | 是 | 除号 | 后缀 `i++ / 2` 中 `/` 在前置表达式后 |
+| 其余（关键字、运算符、`LPAREN`、`LBRACE`、标点…） | 否 | 正则 | 如 `if(x)/re/.test(s)`、`return /a/`、`( /re/ )` |
+
+`prevType == null`（流开头）默认 `true`，即允许正则起始（如脚本首行 `=/re/.exec(s)`）。
 
 在 `punct` 里据此分支（`Lexer.kt:283`）：
 
@@ -91,64 +270,115 @@ private fun canStartRegex(): Boolean {
 }
 ```
 
-`regex`（`Lexer.kt:246`）随后扫描主体，注意用 `inClass` 标志区分字符类 `[...]` 内的 `/`（类内
-的 `/` 不是结束符），遇到换行报错，结尾再吃 flags（`gi` 等）。
+`regex`（`Lexer.kt:246`）扫描主体，用 `inClass` 标志区分字符类 `[...]` 内的 `/`（类内 `/` 不是结束符），
+遇换行报 `LexError("Unterminated regex")`，结尾再吃 flags（`gi` 等）。`pos--; col--` 回退是为了让
+`regex()` 重新从 `/` 开始扫描——这是"单字符决策"后让出扫描权的标准手法。
 
-> 这是 JS 词法最经典、也最易错的歧义，KJS 用"上一个 token 类型"这一轻量状态干净地处理。
+> 这是 JS 词法最经典、也最易错的歧义：KJS 用"上一个 token 类型"这一**轻量状态**干净处理，无需
+> 把词法器升级成完整语法感知（那会模糊词法/语法边界）。
 
-## 4. 各类字面量的扫描要点
+## 8. 标点与多字符运算符（`punct`，`Lexer.kt:266`）
 
-### 4.1 数字（`Lexer.kt:132`）
+`punct` 用 `match` 前瞻做**最长匹配**把多字符运算符合并：
 
-- **十六进制**：`0x…`，跳过 `0x` 后吃 hex 字符；若尾随 `n` 则为 `BigInt`（`BigInteger`），否则
-  转 `Long` 再变 `Double`。
-- **小数/科学计数**：整数部分后若有 `.` 且后面是数字则吃小数部分；`e/E` 后可带正负号与指数。
-- **BigInt 后缀**：仅整数字面量允许尾随 `n`（`sb.none { it == '.' || it == 'e' }`），转 `BigInteger`。
-- 最终值直接存入 `Token.numberValue`（或 `bigIntValue`），Parser 无需再解析数字。
+```kotlin
+294:295:engine/src/main/kotlin/io/kjs/lex/Lexer.kt   (节录)
+'=' -> when { match('=') -> if (match('=')) SEQ("===") else EQ("=="); match('>') -> ARROW("=>"); else ASSIGN("=") }
+'!' -> when { match('=') -> if (match('=')) SNEQ("!==") else NEQ("!="); else NOT("!") }
+'<' -> when { match('=') -> LE("<="); match('<') -> if (match('=')) SHL_ASSIGN("<<=") else SHL("<<"); else LT("<") }
+'>' -> when {
+    match('=') -> GE(">=")
+    match('>') -> when { match('>') -> if (match('=')) USHR_ASSIGN(">>>=") else USHR(">>>"); match('=') -> SHR_ASSIGN(">>="); else SHR(">>") }
+    else -> GT(">")
+}
+```
 
-### 4.2 字符串（`Lexer.kt:168`）
+全部多字符运算符的合并规则：
 
-处理转义：`\n \t \r \\ \" \' \` \0 \b \f \v`，十六进制 `\xHH`，以及 Unicode `\uHHHH` 与
-`\u{...}`（变长码点，用 `appendCodePoint` 写入）。未闭合则抛 `LexError`。**字符串不在此求值**
-（如 `${}` 仅在模板串里处理），原样存 `value`。
+| 首字符 | 合并形态 | 备注 |
+|---|---|---|
+| `=` | `=` → `==` → `===`；`=>`（`ARROW`） | `===`/`!==` 走"最长优先"三层 `match` |
+| `!` | `!=` → `!==`；`!` | |
+| `>` | `>=`；`>>`→`>>=`/`>>>`→`>>>=` | 右移族必须 `match('>')` 套三层 |
+| `<` | `<=`；`<<`→`<<=` | |
+| `&`/`|` | `&&`/`||`；`&=`/`|=` | |
+| `*` | `**`（`POW`）/`*=`；`/`→`/=`（非正则时）；`+`→`+=`/`++`；`-`→`-=`/`--` | |
+| `.` | `...`（`ELLIPSIS`）；`.` | `?.` 未实现（M1 简化） |
+| `?` | `??`（`NULLISH`）；`?` | |
 
-### 4.3 模板字符串（`Lexer.kt:206`）
+每生成 token 都 `setPrev` 以维护 `prevType` 状态链。未知字符抛 `LexError("Unexpected char")`。
 
-反引号串整体作为一个 `TEMPLATE_STRING` 切出，**内部 `${...}` 保留原样**由 Parser 二次解析
-（`depth` 计数嵌套）。这样词法阶段不被表达式语法污染，复杂度下沉到 Parser 的 `expandTemplate`。
+## 9. 注释与空白（`Lexer.kt:94`）
 
-### 4.4 标识符与关键字（`Lexer.kt:226`）
+`skipWhitespaceAndComments` 在每次 `next` 前调用，跳过空格/换行、块注释 `/* */`、行注释 `//`：
 
-`identOrKw` 吃 `[A-Za-z0-9_$]`，再用 `keywords` 映射表（`Lexer.kt:51`）把保留字转成对应
-`TokenType`，否则为 `IDENT`。映射表覆盖全部关键字（`var/let/const/function/if/.../class/of`）。
+```kotlin
+94:110:engine/src/main/kotlin/io/kjs/lex/Lexer.kt
+private fun skipWhitespaceAndComments() {
+    while (pos < source.length) {
+        val c = peek()
+        when {
+            c == ' ' || c == '\t' || c == '\r' || c == '\n' -> advance()
+            c == '/' && peek(1) == '*' -> { advance(); advance(); while (!(peek()=='*' && peek(1)=='/')) advance(); if (pos < source.length){advance();advance()} }
+            c == '/' && peek(1) == '/' -> while (peek() != '\n') advance()
+            else -> return
+        }
+    }
+}
+```
 
-## 5. 标点的歧义消解（`punct`，`Lexer.kt:266`）
+设计上 `/*` 与 `//` 永远不会是合法正则起始（空模式/以 `*` 开头无意义），因此**无需 `prevType` 即可
+安全剥离**。块注释嵌套不被支持（首个 `*/` 即结束），符合 C 风格注释惯例。
 
-`punct` 用 `match` 前瞻把多字符运算符合并：
+## 10. 错误处理：`LexError`
 
-- `=`→`==`→`===`；`!`→`!=`→`!==`；`>`→`>>`→`>>>` 及其 `>=`/`>>=`/`>>>=`；
-- `&`→`&&`/`&=`；`|`→`||`/`|=`；`/`→`/=`（当非正则时）；`*`→`**`/`*=`；`+`→`+=`/`++`；`-`→`-=`/`--`；
-- `.`→`...`（展开）；`?`→`??`（空值合并）。
+词法层三类硬错误：`Unterminated string`、`Unterminated template`、`Unterminated regex`、`Unexpected char`。
+统一抛 `LexError(msg, line, col)`，异常携带位置；`Engine` 层（或 REPL）捕获后格式化展示，不会把
+错误闷在文件末尾才崩。这是"错误必须可定位"的工程底线——`line/col` 从 `next()` 的 `startLine/
+startCol` 透传到 Token 再透传到异常。
 
-每生成 token 都 `setPrev` 以维护 `prevType` 状态链。未知字符抛 `LexError`。
+## 11. 一个完整的 tokenize 追踪：看 `/` 如何在同一行里既是除号又是正则
 
-## 6. 注释与空白（`Lexer.kt:94`）
+对输入 `a / b; /re/g.test(x)`，逐步跟踪 `prevType` 与产出：
 
-`skipWhitespaceAndComments` 在每次 `next` 前调用，跳过空格/换行、块注释 `/* */`、行注释 `//`。
-设计上 `/*` 与 `//` 永远不会是合法正则起始（空模式无意义），因此**无需 `prevType` 即可安全剥离**。
+| 步骤 | 首字符 | `prevType`（决策前） | 决策 | 产出 Token |
+|---|---|---|---|---|
+| 1 | `a` | `null` | 标识符 | `IDENT("a")` → prevType=`IDENT` |
+| 2 | 空格 | `IDENT` | 跳过 | — |
+| 3 | `/` | `IDENT` | `canStartRegex`=`false`（表达式位置）→ 除号 | `SLASH("/")` → prevType=`SLASH` |
+| 4 | 空格 | `SLASH` | 跳过 | — |
+| 5 | `b` | `SLASH` | 标识符 | `IDENT("b")` → prevType=`IDENT` |
+| 6 | `;` | `IDENT` | 标点 | `SEMI(";")` → prevType=`SEMI` |
+| 7 | 空格 | `SEMI` | 跳过 | — |
+| 8 | `/` | `SEMI` | `canStartRegex`=`true`（非表达式位置）→ 正则 | `REGEX("/re/g")` → prevType=`REGEX` |
 
-## 7. 设计取舍
+关键点：**第 3 步与第 8 步是同一个字符 `/`**，仅因前一个 token 类型不同，分别被切成了 `SLASH` 与
+`REGEX`。这正是 `prevType` 状态机的价值——它把"文法层面无法用纯正则描述的 JS 词法歧义"用 O(1)
+状态判明，且不污染语法分析器。
 
-- **状态极轻**：仅 `prevType` 一个回溯状态，却解决了 JS 最难的词法歧义（除号 vs 正则）。
-- **数字即求值**：词法阶段直接算出 `Double/BigInteger` 值，Parser/Compiler 零重复解析。
+## 12. 设计取舍
+
+- **状态极轻**：仅 `prevType` 一个回溯状态，却解决了 JS 最难的词法歧义（除号 vs 正则）；`pos/line/
+  col` 三个位置变量即完整描述"光标"，无需回溯整个输入。
+- **数字即求值**：词法阶段直接算出 `Double/BigInteger` 值，Parser/Compiler 零重复解析，且把"数字
+  合法性"错误提前到词法期（如非法 `0x` 字符）。
 - **模板串下沉到 Parser**：词法只负责"切出反引号整体"，`${}` 表达式交由 Parser 的 `expandTemplate`
-  递归解析，职责清晰。
-- **单一 `next()` 分发**：所有 token 类型在一个 `when` 里分流，新增 token 类型只改一处。
+  递归解析，词法器不被表达式语法污染。
+- **单一 `next()` 分发**：所有 token 类型在一个 `when` 里分流，新增 token 类型只改一处；多字符
+  运算符用 `match` 统一做最长匹配。
+- **`prevType` 而非完整语法栈**：用"前一个 token 类型"近似"表达式位置"，足够消解 `/` 歧义，且
+  保持词法器对语法的无知（职责边界清晰）。
 
-## 8. 常见坑
+## 13. 常见坑
 
 - **正则误判**：忘记更新 `prevType`，或在 `)`/`]` 后可开始正则处误判为除号 → 正则字面量被拆成
-  除法 + 标识符。新增加值/位置 token 后需同步审视 `canStartRegex`。
-- **模板内 `${}` 嵌套**：`depth` 计数必须配对，否则把插值表达式吞掉或提前结束。
-- **多字符运算符顺序**：`>>>=` 这类需从最长匹配优先（`match('>')` 套三层），否则拆错。
+  除法 + 标识符。新增值/位置 token 后需同步审视 `canStartRegex` 的 `false` 列表。
+- **模板内 `${}` 嵌套**：`depth` 计数必须配对，否则把插值表达式吞掉或提前结束；`${a ? `x${b}` : c}`
+  这类混合嵌套尤其易错。
+- **多字符运算符顺序**：`>>>=` 这类需从最长匹配优先（`match('>')` 套三层），否则拆成 `>>=` + `>`
+  或其它错误序列。
 - **未闭合字面量**：字符串/正则/模板未闭合应抛 `LexError` 并带行列，否则读到文件尾才崩，难定位。
+- **ASCII 标识符限制**：引入非 ASCII 变量名或 Unicode 转义 `\u` 标识符会失败；扩展时需同步放宽
+  `identOrKw` 的字符判定与关键字表。
+- **数字前缀限制**：`0o17`/`0b101` 八进制/二进制字面量不被支持，会解析成 `0` + 标识符，需显式支持
+  才能在词法层拦截。
