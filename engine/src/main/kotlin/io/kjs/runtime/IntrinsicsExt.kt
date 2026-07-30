@@ -369,8 +369,18 @@ object IntrinsicsExt {
             else String.format("%.${JsValues.toInt32(arg(a, 0))}g", n)
         })
         p.set("toExponential", fn("toExponential", 1) { self, a ->
-            val n = JsValues.toNumber(self); val d = if (arg(a, 0) == JsValues.UNDEFINED) 6 else JsValues.toInt32(arg(a, 0))
-            String.format("%.${d}e", n)
+            val n = JsValues.toNumber(self)
+            if (arg(a, 0) == JsValues.UNDEFINED) {
+                // No digits argument: use as many as needed to represent the value exactly.
+                val s = String.format("%e", n)                       // e.g. "1.000000e+21"
+                // Trim trailing zeros in the mantissa.
+                val (mant, exp) = s.split('e')
+                val trimmed = mant.trimEnd('0').trimEnd('.')
+                "${trimmed}e${if (exp.startsWith("+") || exp.startsWith("-")) exp else "+$exp"}"
+            } else {
+                val d = JsValues.toInt32(arg(a, 0))
+                String.format("%.${d}e", n)
+            }
         })
     }
 

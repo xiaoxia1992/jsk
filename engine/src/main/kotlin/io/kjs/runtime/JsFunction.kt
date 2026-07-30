@@ -49,7 +49,7 @@ class JsFunction private constructor(
 
 /** Lexical environment / scope. */
 class Environment(val parent: Environment? = null) {
-    private val vars = HashMap<String, Any?>()
+    @JvmField internal val vars = HashMap<String, Any?>()
 
     fun declare(name: String, value: Any?) { vars[name] = value }
     fun has(name: String): Boolean { var e: Environment? = this; while (e != null) { if (e.vars.containsKey(name)) return true; e = e.parent }; return false }
@@ -69,5 +69,20 @@ class Environment(val parent: Environment? = null) {
             var e: Environment = this; while (e.parent != null) e = e.parent!!
             e.vars[name] = value
         }
+    }
+
+    /**
+     * Resolve which Environment owns [name], walking the parent chain.
+     * Returns null if the name is not bound anywhere. Used by the JIT's
+     * inline cache for LOAD_GLOBAL so subsequent hits bypass the linear
+     * scope walk entirely.
+     */
+    fun resolveOwner(name: String): Environment? {
+        var e: Environment? = this
+        while (e != null) {
+            if (e.vars.containsKey(name)) return e
+            e = e.parent
+        }
+        return null
     }
 }
