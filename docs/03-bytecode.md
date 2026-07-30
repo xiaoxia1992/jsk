@@ -60,7 +60,7 @@ fun fnIdx(f: Bytecode): Int { var i = functions.indexOf(f); if (i < 0) { i = fun
 53:62:engine/src/main/kotlin/io/kjs/ir/Bytecode.kt
 fun emit(op: Op, a: Int = 0, b: Int = 0) { code.add(op.ordinal); aOps.add(a); bOps.add(b) }
 fun emitNumber(v: Number) = emit(Op.CONST, constIdx(v.toDouble()))
-fun emitString(s: String) = emit(Op.LOAD_CONST_STR, strIdx(s))
+fun emitString(s: String) = emit(Op.LOAD_STR, strIdx(s))
 fun patchA(at: Int, a: Int) { aOps[at] = a }   // 回填操作数 A（如跳转目标）
 fun patchB(at: Int, b: Int) { bOps[at] = b }   // 回填操作数 B
 ```
@@ -171,26 +171,40 @@ fun disasm(): String {
 
 ## 6. 指令集（Opcode.kt）
 
-`Op`（`Opcode.kt:17`）是全部指令的枚举，VM 的 `when(op)`（D5 §8）逐条实现。按职责分组：
+`Op`（`Opcode.kt:17`）是全部指令的枚举（共 70 余条，`< 80 ops`），VM 的 `when(op)`（D5 §8）逐条实现。
+所有指令统一为"8 位 opcode + A/B 双操作数"的定宽布局；按职责分组（与源码 `Opcode.kt` 一一对应）：
 
-- **常量/加载**：`CONST`（数字）、`LOAD_CONST_STR`、`LOAD_NULL`、`LOAD_TRUE`、`LOAD_FALSE`、
-  `LOAD_UNDEFINED`、`LOAD_THIS`、`LOAD_ARGUMENTS`。
-- **栈/局部/参数**：`DUP`、`POP`、`LOAD_LOCAL`、`STORE_LOCAL`、`LOAD_ARG`、`STORE_ARG`、
-  `LOAD_GLOBAL`、`STORE_GLOBAL`、`DECL_GLOBAL`。
-- **属性/下标**：`LOAD_PROP`、`STORE_PROP`、`LOAD_ELEM`、`STORE_ELEM`、`LOAD_PROP_BYVAL`、
-  `DEL_PROP`。
-- **运算**：`ADD`、`SUB`、`MUL`、`DIV`、`MOD`、`POW`、`NEG`、`INC`、`DEC`；`BITAND/BITOR/BITXOR/
-  SHL/SHR/USHR`；`LT/GT/LE/GE/EQ/NEQ/SEQ/SNEQ`；`AND_LOG/OR_LOG`（理论保留，编译器改用 `JF_KEEP`）。
-- **构造**：`MAKE_OBJECT`、`MAKE_ARRAY`、`MAKE_FUNCTION`/`MAKE_CLOSURE`、`MAKE_CLASS_INSTANCE`。
-- **控制流**：`JMP`、`JT`、`JF`、`JT_KEEP`、`JF_KEEP`、`RET`、`RET_UNDEF`、`HALT`；`PUSH_BLOCK`、
-  `POP_BLOCK`（块级作用域边界）。
-- **调用/构造**：`CALL`、`CALL_METHOD`、`NEW_OP`、`SPREAD`（展开实参）、`STASH_RESULT`。
-- **闭包**：`LOAD_UPVAL`、`STORE_UPVAL`、`MAKE_CLOSURE`。
-- **异常**：`THROW`、`TRY_ENTER`、`TRY_EXIT`、`END_FINALLY`。
-- **迭代**：`FOR_IN_INIT`、`FOR_IN_NEXT`、`FOR_OF_INIT`、`FOR_OF_NEXT`。
+- **常量/加载**：`LOAD_UNDEF`、`LOAD_NULL`、`LOAD_TRUE`、`LOAD_FALSE`、`LOAD_ZERO`、`LOAD_ONE`、
+  `LOAD_INT`(a=字面值)、`LOAD_CONST`(a=常量池下标)、`LOAD_STR`(a=字符串池下标)。
+- **局部/参数**：`LOAD_LOCAL`(a=槽)、`STORE_LOCAL`(a=槽，弹)、`LOAD_ARG`(a=实参下标)、
+  `STORE_ARG`(a=实参下标，弹)、`LOAD_ARGUMENTS`（按需构造 `arguments` 对象）。
+- **名称解析**：`LOAD_GLOBAL`/`STORE_GLOBAL`(a=名字)、`DECL_GLOBAL`(a=名字，声明 let/const 并弹初值)；
+  `LOAD_UPVAL`/`STORE_UPVAL`(a=闭包 upvalue 下标)。
+- **属性/下标**：`LOAD_PROP`(a=名字，弹 obj)、`STORE_PROP`(a=名字，栈 `[obj,value]→value`)、
+  `LOAD_ELEM`(栈 `[obj,key]→value`)、`STORE_ELEM`(栈 `[obj,key,value]→value`)、
+  `DELETE_PROP`(a=名字)、`DELETE_ELEM`(栈 `[obj,key]→bool`)。
+- **构造**：`MAKE_OBJECT`(a=键值对数)、`MAKE_ARRAY`(a=元素数)、`MAKE_CLOSURE`(a=functions[] 下标，
+  捕获当前环境)。
+- **栈操作**：`DUP`、`POP`、`SWAP`。
+- **算术/逻辑**：`ADD/SUB/MUL/DIV/MOD/POW`、`NEG/PLUS/NOT/BITNOT/TYPEOF/VOID_OP`、`TO_NUMBER`
+  （`++/--` 的强制）、`BITAND/BITOR/BITXOR/SHL/SHR/USHR`、`EQ/NEQ/SEQ/SNEQ/LT/LE/GT/GE`、
+  `INSTANCEOF/IN_OP`、`AND_LOG/OR_LOG`（理论保留，编译器实际改用 `JT_KEEP/JF_KEEP`，不进 VM）。
+- **控制流**：`JMP`(a=绝对 pc)、`JT`(弹，真跳)、`JF`(弹，假跳)、`JT_KEEP`(`||` 短路：真则保留栈顶
+  并跳，否则弹)、`JF_KEEP`(`&&` 短路：假则保留栈顶并跳，否则弹)。
+- **调用/构造**：`CALL`(a=argc，栈 `[fn,arg1..argN]→结果`)、`CALL_METHOD`(a=argc，栈
+  `[obj,fn,arg1..argN]→结果`，`obj` 作 `this`)、`NEW_OP`(a=argc，栈 `[ctor,arg1..argN]→实例`)、
+  `GET_THIS`、`RET`(弹栈顶作返回值)、`RET_UNDEF`。
+- **作用域/块**：`PUSH_BLOCK`、`POP_BLOCK`（let/const 块边界；实际仅作栅栏，不回收槽，D4 §3）。
+- **异常**：`THROW`、`TRY_ENTER`(a=catch pc, b=finally pc，无则 -1)、`TRY_EXIT`、`END_FINALLY`。
+- **迭代**：`FOR_IN_INIT`(弹 obj，压 IterState)、`FOR_IN_NEXT`(a=取完跳转 pc，压 key)、
+  `FOR_OF_INIT`(弹 obj，压 ForOfState)、`FOR_OF_NEXT`(a=取完跳转 pc，压 value)。
+- **顶层求值**：`STASH_RESULT`(弹栈顶进 `frame.lastResult`)、`HALT`(返回 `lastResult`)。
 
 末尾 `OP_VALUES`（`Opcode.kt:104`）是 `{ordinal → Op}` 反向表，VM 用它把 `code[pc]` 的整数瞬间映射
 回枚举，零分支成本。
+
+> 注意：`obj[k]` 这类**动态键**访问走 `LOAD_ELEM`/`STORE_ELEM`（键在栈上），而非虚构的
+> `LOAD_PROP_BYVAL`；展开 `f(...arr)` 在编译期降级为 `fn.apply(this, argsArr)`，无专属 opcode（D4 §9、D5 §17）。
 
 ## 7. 设计取舍
 

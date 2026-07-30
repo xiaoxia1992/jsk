@@ -251,16 +251,71 @@ continue` 通过 `breakPatches/continuePatches`（`Compiler.kt:154`）在循环�
 
 ## 6. class 解语法糖（核心原理五）
 
-VM 没有原生 class，`compileClass`（`Compiler.kt:485`）把 `class` 解成"构造函数 + 原型赋值"：
+VM 没有原生 class，`compileClass`（`Compiler.kt:486`）把 `class` 整体解成"构造函数 + 原型链 + 属性赋值"，
+全程只用已有的 `MAKE_CLOSURE`/`STORE_PROP`/`LOAD_PROP`/`CALL_METHOD` 等原语，不新增任何 opcode。
+完整流程分五步（对照 `compileClass` 与 `buildClassCtorFunction`）：
 
-- 构造 `ClassDecl.constructor`（或默认空构造）编译成普通 `FunctionExpr`。
-- 遍历 `members`：实例方法挂到 `prototype`，静态方法挂到构造函数对象本身（`emit(STORE_PROP,
-  strIdx("prototype"))` 等）。`get/set` 访问器用 `Object.defineProperty` 语义发射。
-- 继承（`superClass`）：在构造函数体顶部插入 `superClass.prototype` 作为新实例原型的设置，并把
-  `super` 引用解析到外层 `this` 与原型链（通过 `SuperMember/SuperCall` AST 节点编译成相应属性访问）。
-- 最终发射 `MAKE_CLASS_INSTANCE` 组合出完整类对象，交给调用处 `STORE_LOCAL` 等。
+### 6.1 父类表达式求值 → 临时槽
 
-> 解糖让 class 完全落在"函数 + 原型 + 属性"这套已实现的原语上，VM 无需为 class 新增任何 opcode。
+若声明了 `extends <super>`，先把父类求值存进一个 `const` 临时槽 `__super${uid}__`（`declareLocal`
++ `STORE_LOCAL`），后续所有 `super.xxx` 都引用这个槽。`super` 使能期间压入 `classStack`
+（`Compiler.kt:471`）一个 `ClassCtx`，让本类及嵌套方法体内的 `SuperMember/SuperCall` 能找到该槽名。
+
+### 6.2 构造函数合成（buildClassCtorFunction）
+
+不是直接编译用户写的 `constructor`，而是先合成一个 `FunctionExpr`：
+
+- **实例字段**：所有非静态 `FIELD` 成员被前置成 `this.x = init;`（在用户 ctor 体之前执行）。
+- **子类默认构造**：若用户没写 ctor，合成 `constructor(...args) { super(...args); }`（`rest` 参数 +
+  `SuperCall` 带展开）。
+- **基类默认构造**：合成空体 `constructor() {}`。
+- **有 ctor**：把实例字段语句 + 用户 ctor 体拼成新函数体。
+
+随后 `compileFunction` 把它编译成普通字节码并 `MAKE_CLOSURE`，ctor 句柄暂存 `ctorSlot` 临时槽。
+
+### 6.3 原型链接线（prototype 拓扑）
+
+```kotlin
+// 节选自 engine/src/main/kotlin/io/kjs/ir/Compiler.kt
+// ctor.prototype = Object.create(super ? super.prototype : Object.prototype)
+LOAD_LOCAL ctorSlot
+LOAD_GLOBAL "Object" ; LOAD_PROP "create"
+[superVar.prototype 或 Object.prototype]        // 新实例的原型
+CALL 1 ; STORE_PROP "prototype" ; POP
+// ctor.prototype.constructor = ctor
+LOAD_LOCAL ctorSlot ; LOAD_PROP "prototype"
+LOAD_LOCAL ctorSlot ; STORE_PROP "constructor" ; POP
+```
+
+这一步在 VM 运行期复刻了标准 JS 的"实例.__proto__ === Ctor.prototype"与
+"Ctor.prototype.constructor === Ctor"双向指向。
+
+### 6.4 静态成员继承（setPrototypeOf）
+
+仅当 `extends` 时：`Object.setPrototypeOf(ctor, super)`（`Compiler.kt:540`），使子类构造器自身能
+继承父类的静态方法/属性（静态成员沿"构造器原型链"向上找）。
+
+### 6.5 方法 / 访问器 / 字段的落位
+
+遍历 `members`（`Compiler.kt:552`）：
+
+- 实例方法/访问器：挂在 `ctor.prototype` 上（`LOAD_LOCAL ctorSlot; LOAD_PROP "prototype"`）。
+- 静态方法/字段：直接挂在 `ctorSlot`（构造函数对象）上。
+- 每条成员都是一次 `compileFunction` + `MAKE_CLOSURE` + `STORE_PROP("name")` + `POP`。
+- **访问器简化**：`get/set` 当前被当作普通方法挂上（源码注释明说"proper `Object.defineProperty`
+  才是规范路径"），属已知简化——访问器会带上 `()` 才能调用，不是真正的 getter/setter 语义。
+- **实例字段**：非静态 `FIELD` 已在 §6.2 注入 ctor 预导，这里只处理静态字段。
+
+### 6.6 super 的编译
+
+- `super.prop`（`compileSuperMember` `Compiler.kt:635`）：编译成 `__superVar.prototype.prop`——
+  即从父类原型上读，不是从实例上读。
+- `super(...args)`（`compileSuperCall` `Compiler.kt:649`）：编译成 `__superVar.call(this, ...args)`
+  （无展开）或 `__superVar.apply(this, argsArr)`（有展开）。关键是用 `GET_THIS` 把当前实例绑定成
+  `this`，从而父类 ctor 的初始赋值落到正确实例上。
+
+> 解糖让 class 完全落在"函数 + 原型 + 属性"这套已实现的原语上，VM 无需为 class 新增任何 opcode；
+> 但访问器与 `this` 在静态方法中的指向等细节仍是 M2 简化点。
 
 ## 7. 参数前导（prelude）：默认值 / 解构 / rest
 
@@ -294,10 +349,122 @@ VM 没有原生 class，`compileClass`（`Compiler.kt:485`）把 `class` 解成"
 - `CALL`：先编译 callee，再按顺序编译各实参（参数入栈顺序 = `arg0..argN-1`，D5 §4）。
 - `CALL_METHOD`（`obj.method(...)`）：先编译 `obj` 入栈，再编译实参，最后发射（VM 弹出 `obj` 作 `this`）。
 - `NEW_OP`：`new Ctor(...)`，编译 `ctor` + 实参后发射（`this` = 新实例，D5 §4）。
-- `SPREAD`：`f(...arr)` 把数组展开成多个实参，发射 `SPREAD` + `emitBuildArgsArray`（`Compiler.kt:1209`）
+- **展开无专属 opcode**：`f(...arr)` 由 `emitBuildArgsArray`（`Compiler.kt:1209`）用 `Array.prototype
+  .concat`/`push` 把实参拼成 `JsArray`，再以 `fn.apply(thisObj, argsArr)` 调用，运行期只是一次
+  普通 `CALL_METHOD`（D5 §17）
   在运行时集合成 `argsArr`。
 
-## 10. 设计取舍
+## 10. 解构绑定模式的编译（核心原理八）
+
+除参数前导外，所有 `let/const/var`、`=` 赋值、`=` 形参数默认值、for-of 等都会走到 `compileBindPattern`
+（`Compiler.kt:291`）。它消费栈顶一个 RHS 值，按模式把子值绑定到各自目标。模式分四类：
+
+### 10.1 标识符 + 默认值
+
+`IdentPattern`（`Compiler.kt:293`）：栈顶是值，若 `pattern` 带默认值先调 `applyDefault`（见 §12），
+再 `bindIdent`（`Compiler.kt:326`）按 `kind` 落位——`var` 写入已解析的 local 或 `DECL_GLOBAL`，
+`let/const` 走 `declareLocal` 新开槽，`""` 表示纯赋值（写已有 local/global）。
+
+### 10.2 数组模式 `[a, , b, ...rest]`
+
+`compileBindArrayPattern`（`Compiler.kt:381`）把 RHS 暂存到 scratch 槽 `rhsSlot`，然后逐元素：
+`LOAD_LOCAL rhsSlot; LOAD_INT i; LOAD_ELEM` 取 `rhs[i]`，递归 `compileBindPattern`；`rest` 用
+`rhs.slice(n)`（`.slice` + `CALL_METHOD 1`）得到剩余数组再绑定。
+
+### 10.3 对象模式 `{a, b: x, ...rest}`
+
+`compileBindObjectPattern`（`Compiler.kt:408`）同样把 RHS 存 scratch 槽，逐 prop：
+`LOAD_LOCAL rhsSlot; LOAD_PROP key` 取属性后递归绑定。`rest` 较特殊：先 `Object.assign({}, rhs)`
+得到浅拷贝，再对每个已消费 key 执行 `DELETE_PROP`，从而模拟"其余自有属性"语义。
+
+### 10.4 默认值与 assign 目标
+
+- 默认值的字节码形态见 §12（`DUP; LOAD_UNDEF; SEQ; JF` 跳过 → 否则 `POP` + 编译默认表达式）。
+- `AssignTargetPattern`（`Compiler.kt:301`）用于"赋值到任意表达式目标"（如 `[o.x] = rhs`），
+  用 `compileAssignTargetStoreTopLeaveValue` 计算 obj 并 `STORE_PROP`，最后 `POP` 丢弃。
+
+> 所有解构统一"先存 scratch 槽 → 反复索引/取属性"的策略，避免重复求值 RHS，且天然支持嵌套
+> 解构与默认值组合。
+
+## 11. 更新与复合赋值（核心原理九）
+
+`++/--` 与 `+=` 等需要"读旧值 → 计算 → 写回 → 决定表达式值"。
+
+### 11.1 ++ / -- （compileUpdate）
+
+`readAndStore`（`Compiler.kt:985`）的标准序列（以 `++` 为例）：
+
+```
+loadCurrent        // old
+TO_NUMBER          // old(已转 number)
+DUP                // old, old
+LOAD_ONE           // old, old, 1
+ADD                // old, new
+[前缀] DUP; storeNew; POP; SWAP; POP   // 结果留下 new
+[后缀] DUP; storeNew; POP; POP         // 结果留下 old
+```
+
+- `storeNew` 对 `Ident` 走 `emitStoreIdent`；对 `Member` 先存 `tmpObj`/`tmpKey` 临时槽，再用
+  `LOAD_ELEM/STORE_ELEM` 读写（见 `Compiler.kt:1009`）。
+- `TO_NUMBER` 保证 `"5"++` 得到 `6` 而非字符串拼接，符合 JS 语义。
+- 前缀/后缀的差异只在最后保留栈上的 `new` 还是 `old`。
+
+### 11.2 += 等（compileAssign 复合分支）
+
+`a += b` 展开为 `a = a + b`（`Compiler.kt:1061`）：`emitLoadIdent(a)` 取旧值 → 编译 `b` → `ADD`
+→ `DUP` 后 `emitStoreIdent(a)` 写回 → `POP` 留下新值。成员目标同样用 `__cmp_obj__/__cmp_key__`
+临时槽完成"读-算-写回"。
+
+## 12. 数值字面量发射优化（核心原理十）
+
+`emitNumber`（`Compiler.kt:922`）按值形状选最紧凑的 opcode，减小常量池与指令数：
+
+| 情形 | 发射 | 说明 |
+|---|---|---|
+| `0`（且非 `-0`） | `LOAD_ZERO` | `1.0/d < 0` 排除 `-0` |
+| `1` | `LOAD_ONE` | |
+| 落在 `Int` 范围且无小数 | `LOAD_INT asInt` | 省去常量池槽 |
+| 其它 | `LOAD_CONST constIdx(d)` | 大数/浮点走常量池 |
+
+`BigIntLit` 固定走 `LOAD_CONST`（`constIdx` 存 `String`），`StringLit/TemplateLit` 走 `LOAD_STR`。
+
+## 13. for-in / for-of 的字节码发射（核心原理十一）
+
+两个循环共享"迭代器 + 回填"模式，区别在于 VM 提供的迭代原语：
+
+- **for-in**（`compileForIn` `Compiler.kt:758`）：编译右侧得对象 → `FOR_IN_INIT`（VM 取可枚举自有
+  + 继承 key 集合）→ 循环体顶部 `FOR_IN_NEXT -1` 取下一个 key，回填到目标后 `POP` 丢弃表达式值。
+- **for-of**（`compileForIn` `Compiler.kt:781`）：`FOR_OF_INIT` 先 `obj[Symbol.iterator]()` 拿到
+  迭代器存 VM 句柄槽，循环体 `FOR_OF_NEXT -1` 调 `iterator.next()`，命中 `done` 则跳到 `end`。
+- 两者都 `enterBlock` 声明循环变量（若为 `let/const`），循环末尾 `JMP top` 回到取数点；
+  `break/continue` 通过 `loopPatches` 回填到 `end`/`top`，`end` 后 `POP` 释放迭代器句柄。
+
+> 迭代状态完全由 VM 在帧外维护（见 D5 §15），编译器只负责"开启—取值—结束"三件套，因而
+> 解构/展开/迭代协议都不需要新 opcode。
+
+## 14. try/catch/finally 的字节码布局（核心原理十二）
+
+`compileTry`（`Compiler.kt:802`）用 `TRY_ENTER`/`TRY_EXIT`/`END_FINALLY` 三指令框住异常流：
+
+```
+TRY_ENTER  catchPc, finallyPc      // 两操作数均先填 -1，编译完回填
+<try 块>
+TRY_EXIT
+JMP  finallyPc(A)                  // 正常落地的跳转，跳过 catch
+--- catchPc ---
+[enterBlock; declare catchParam; STORE_LOCAL; POP]
+<catch 块>
+leaveBlock
+--- finallyPc ---                  // 无论正常/异常都到这
+<finally 块>
+END_FINALLY                        // 把异常（若有）继续向上抛
+```
+
+- `TRY_ENTER` 两个操作数：catch 入口 `patchA`、finally 入口 `patchB`，编译期未知故先 `-1`。
+- catch 参数绑定到新槽；无 catch 时 `catchPc = -1`（VM 直接跳过）。
+- `END_FINALLY` 是异常传播的"续传点"：若进入 finally 是因为异常，这里重新抛出，否则正常结束。
+
+## 15. 设计取舍
 
 - **每函数一 Compiler + parent 链**：闭包/作用域天然落在编译器结构上，Upvalue 沿链解析。
 - **槽号代替名字**：运行时零哈希查找（`Frame.locals[slot]`），是 VM 快的关键之一。
@@ -306,7 +473,7 @@ VM 没有原生 class，`compileClass`（`Compiler.kt:485`）把 `class` 解成"
 - **class 全解糖**：不污染 VM opcode 集，class = 函数+原型+属性。
 - **标识符四级回退**：局部 → upvalue → arguments → 全局，覆盖 JS 全部名称解析路径。
 
-## 11. 常见坑
+## 16. 常见坑
 
 - **补丁点记录时机**：占位 `emit` 后必须立即存 `at`，否则 `code.size-1` 指错（D3 §8）。
 - **`var` 提升边界**：`resolveLocal` 须在函数作用域边界停止，否则跨函数共享槽号。
@@ -317,3 +484,11 @@ VM 没有原生 class，`compileClass`（`Compiler.kt:485`）把 `class` 解成"
   复用槽"的优化，深层嵌套块会使 `localCount` 偏大，但正确性无虞。
 - **class 继承原型顺序**：`superClass.prototype` 设置必须在实例属性赋值前，否则覆盖错序。
 - **rest 参数与前导**：解构/rest 前导须在"参数已绑槽"之后，且 `localCount` 要覆盖临时槽。
+- **解构 scratch 槽必须覆盖 `localCount`**：`declareScratchLocal` 开的临时槽也计入最终 `localCount`
+  （§2.6），否则 VM 建帧时数组太小，运行期越界。
+- **`emitNumber` 别手填 `-0` 特例**：`0.0` 与 `-0.0` 必须区别（前者 `LOAD_ZERO`、后者 `LOAD_CONST`），
+  否则 `Object.is(-0, 0)` 语义失真。
+- **前缀/后缀更新的栈平衡**：`readAndStore` 的最后一步必须用 `SWAP; POP`（前缀）或 `POP`（后缀）
+  精确丢弃，否则表达式值或栈高度错乱（§11.1）。
+- **`TRY_ENTER` 两个回填点缺一不可**：catch 与 finally 入口都要在 `compileTry` 末尾 `patchA/patchB`，
+  漏填任一个会让 VM 跳到 `0` 或野地址。

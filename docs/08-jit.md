@@ -95,6 +95,32 @@ flowchart TD
 于是 `sumN`/`poly`/`square` 这类热点数值循环，每次迭代都是纯原生 `double` 运算，**完全不碰堆**，
 HotSpot C2 进一步把它们优化进 XMM 寄存器（`Jit.kt:38` 注释）。
 
+### 3.4 逐指令映射示例（以数值循环为例）
+
+以 `function sum(n){var s=0;for(var i=0;i<n;i++)s=s+i;return s;}` 说明抽象解释+发射如何落地。
+`inferDoubleLocals` 投出 `s`(槽0)、`i`(槽1)、`n`(槽2 参数) 均为 `DOUBLE`，于是：
+
+| KJS 字节码 | 抽象栈 | 生成的 JVM 指令 |
+|---|---|---|
+| `LOAD_INT 0` (i=0) | `[D]` | `DCONST_0` |
+| `STORE_LOCAL 1` (i) | `[]` | `DSTORE 1` |
+| `L1: LOAD_LOCAL 1` (i) | `[D]` | `DLOAD 1` |
+| `LOAD_LOCAL 2` (n) | `[D,D]` | `DLOAD 2` |
+| `LT` | `[B]` | `DCMPL; IFGE L2` |
+| `LOAD_LOCAL 0` (s) | `[D]` | `DLOAD 0` |
+| `LOAD_LOCAL 1` (i) | `[D,D]` | `DLOAD 1` |
+| `ADD` | `[D]` | `DADD` |
+| `STORE_LOCAL 0` (s) | `[]` | `DSTORE 0` |
+| `LOAD_LOCAL 1; LOAD_ONE; ADD` | `[D]` | `DLOAD 1; DCONST_1; DADD` |
+| `STORE_LOCAL 1` | `[]` | `DSTORE 1` |
+| `JMP L1` | `[]` | `GOTO L1` |
+| `L2: LOAD_LOCAL 0; RETURN` | — | `DLOAD 0; ARETURN` |
+
+要点：`s=s+i` 全程 `DLOAD/DADD/DSTORE`，没有任何 `Double.valueOf`/`JsValues.toNumber`；
+`i<n` 用 `DCMPL+IFGE` 直接比较。若 `n` 实际传入非数字（如字符串），`inferDoubleLocals` 会把槽2
+降级为 `ANY`，发射期 `LOAD_LOCAL 2` 走 `boxTop` → `JitBridge.lt` 慢路径，单个调用退化为全装箱，
+但**不影响其它调用或正确性**（见 §5 回退策略）。
+
 ## 4. 属性访问与原型链：复用同一份 IC
 
 `LOAD_PROP` 不是把属性查找逻辑内联进生成代码，而是调用 `JitBridge.loadProp`（`Jit.kt:603`、`JitBridge.kt:98`）。
