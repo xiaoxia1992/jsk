@@ -75,49 +75,208 @@ class Jit_sum_7_a0 extends Compiled {
 
 `emitBody` 在方法开头生成一段**序言**，把 `argsArr` 拷进局部槽。规则与解释器（`Vm.runFrame` 里 `frame.locals[i] = argsArr[i]`）完全一致：
 
-1. `for (i in 0 until paramCount)`：`argsArr[i]` 若**被抽象解释为 DOUBLE**，先 `bridge.toD` 转成原生 double 再 `DSTORE i`；否则 `ASTORE i`。参数不足则补 `UNDEFINED`。
+1. `for (i in 0 until paramCount)`：先 `ALOAD argsArr; ARRAYLENGTH` 做一次长度检查（**实参不足就压 `UNDEFINED`**），够则 `AALOAD` 取 `argsArr[i]`；随后若该参数**被抽象解释为 DOUBLE**，用 `bridge.toD` 转成原生 double 再 `DSTORE`，否则直接 `ASTORE`。
 2. 其余局部槽（`var`/`let` 声明）初始化为 `0.0`（double 槽）或 `null`（object 槽）。
-3. `GET_THIS`（若有）从局部槽 1 取（`thisVal` 被放在 `argsArr` 的槽 1 位置，见 D5 §3 的 `argsArr[1]=thisVal`）。
+3. `GET_THIS`（若有）直接 `ALOAD 4` —— `thisVal` 就是 `invoke` 的第 4 个参数，占 JVM 槽 4，不需要任何查表。
 
-> 局部槽布局：参数在前 `0..paramCount-1`，随后是 `var`/`let` 局部（按源码出现顺序分配）。例如 `function sum(n){var s=0; var i=0; for(...){s=s+i} return s}` 的槽位为 **`n`=槽0、`s`=槽1、`i`=槽2**（double 各占 1 槽）。注意 `n` 一定是槽 0，因为解释器就是 `frame.locals[i]=argsArr[i]` 把参数铺在 0 号起。
+> **两套"槽号"别混淆**：
+> - **KJS 槽号**（解释器 `frame.locals[]` 的下标）：参数在前 `0..paramCount-1`，随后是 `var`/`let` 局部。`function sum(n){var s; var i; …}` → **`n`=0、`s`=1、`i`=2**。`n` 一定是 0，因为解释器就是 `frame.locals[i]=argsArr[i]` 把参数铺在 0 号起。
+> - **JVM 槽号**（生成方法的 local slot）：低位槽被 `invoke` 的参数占掉了，KJS 局部**从槽 6 开始**排，且 `double` 每个占 **2** 个槽。所以 `sum` 的 `n/s/i` 落在 JVM 槽 **6 / 8 / 10**（见 §2.4.1 的对照表）。
 
-### 2.4 一个具体例子：`sum`
+### 2.4 一个具体例子：`sum`（逐行拆解，零基础可读）
 
-原始 JS：
+这一节是全文最重要的"眼见为实"。我们把一段最普通的 JS 循环，一路跟到它变成 JVM 指令为止。
+
+#### 2.4.0 先扫盲：JVM 字节码怎么读
+
+JVM 和 KJS 一样是**栈机（stack machine）**：指令里不写寄存器名字，值全靠一个**操作数栈**传递，另外有一排**编号的局部变量槽（local slot）**当变量用。
+
+助记符的拼法有规律，拆成两半就能读懂：
+
+| 部件 | 含义 | 例子 |
+|---|---|---|
+| **首字母 = 数据类型** | `D`=double（64 位浮点）、`I`=int、`A`=引用（对象 / `Object`）、`L`=long、`F`=float | `DLOAD` 读一个 double，`ALOAD` 读一个对象 |
+| **后半 = 动作** | `CONST_x` 压常量、`LOAD n` 把槽 n 读到栈顶、`STORE n` 把栈顶写回槽 n、`ADD`/`SUB` 弹两个算完压回 | `DSTORE 8` = 把栈顶的 double 存进槽 8 |
+
+所以 `DLOAD 10` 念作"把 10 号槽里的 double 压到栈顶"，`ASTORE 6` 念作"把栈顶那个对象存进 6 号槽"。就这么简单。
+
+下面例子里出现的全部指令，一次列全（`…` 表示栈里更下面的内容，最右边是栈顶）：
+
+| 指令 | 干什么 | 栈变化 |
+|---|---|---|
+| `ALOAD n` | 把局部槽 n 里的**对象**压栈 | `… → …, obj` |
+| `AALOAD` | 弹出「数组, 下标」，压回该元素 | `…, arr, idx → …, v` |
+| `ARRAYLENGTH` | 弹出数组，压回它的长度 | `…, arr → …, len` |
+| `DLOAD n` | 把槽 n 的 double 压栈 | `… → …, d` |
+| `DSTORE n` | 弹出栈顶 double，写进槽 n | `…, d → …` |
+| `DCONST_0` / `DCONST_1` | 压常量 `0.0` / `1.0` | `… → …, d` |
+| `LDC 42.0` | 压任意常量 | `… → …, d` |
+| `DADD` | 弹两个 double，相加，压回结果 | `…, a, b → …, a+b` |
+| `DCMPL` | 弹两个 double 比较，压一个 int：`a<b`→`-1`、`a==b`→`0`、`a>b`→`1`（含 `NaN` 时压 `-1`） | `…, a, b → …, i` |
+| `IFLT L` | 弹一个 int，若 `< 0` 就跳到标签 `L` | `…, i → …` |
+| `IFEQ L` | 弹一个 int，若 `== 0` 就跳到标签 `L` | `…, i → …` |
+| `ICONST_0` / `ICONST_1` | 压 int `0` / `1`（JVM 里 `boolean` 底层就是 int） | `… → …, i` |
+| `SIPUSH k` | 压一个 int 常量 `k`（数组下标之类用它） | `… → …, k` |
+| `GOTO L` | 无条件跳到 `L` | 不变 |
+| `DUP2` | 复制栈顶的 double（double 占 2 个"栈字"，所以叫 `DUP`**2**） | `…, d → …, d, d` |
+| `POP2` | 丢掉栈顶的 double | `…, d → …` |
+| `INVOKESTATIC C.m` | 调用静态方法：按签名弹参数、压返回值 | 视签名而定 |
+| `ARETURN` | 把栈顶的**对象**当返回值返回，方法结束 | — |
+
+> **一个必须先说清的点**：`invoke` 的返回类型是 `Object`。所以哪怕函数内部算出来的是原生 `double`，**跨出函数边界之前也必须 `Double.valueOf` 装箱**，再 `ARETURN`。原生 `double` 只在函数**体内部**流动 —— 这既是 JVM 的类型规则，也是 §6 语义一致性的一环（外界拿到的永远是和解释器一模一样的 `Double` 对象）。
+
+#### 2.4.1 局部槽的编号为什么从 6 开始
+
+生成的 `invoke(vm, realm, closure, thisVal, argsArr)` 是个**实例方法**，JVM 会先按顺序把 `this` 和 5 个参数占掉低位槽，KJS 自己的局部变量只能从后面排：
+
+| JVM 槽 | 装的东西 |
+|---|---|
+| 0 | `this`（生成类自己的实例） |
+| 1 | `vm` |
+| 2 | `realm` |
+| 3 | `closure` |
+| 4 | `thisVal` |
+| 5 | `argsArr` |
+| **6 起** | KJS 的局部变量（`Jit.emitBody` 里就是 `var s = 6`） |
+
+再叠加"**`double` 占 2 个槽**"的 JVM 规则，`sum` 的完整映射是：
+
+| JS 变量 | KJS 槽（解释器视角） | 抽象解释推断类型 | JVM 槽 |
+|---|---|---|---|
+| `n`（参数） | 0 | DOUBLE | **6**（吃掉 6、7） |
+| `s` | 1 | DOUBLE | **8**（吃掉 8、9） |
+| `i` | 2 | DOUBLE | **10**（吃掉 10、11） |
+
+#### 2.4.2 第一层：原始 JS
 
 ```js
 function sum(n) {
   var s = 0;
   var i = 0;
-  for (var i = 0; i < n; i++) {
+  for (i = 0; i < n; i = i + 1) {
     s = s + i;
   }
   return s;
 }
 ```
 
-抽象解释 + 发射后，`Compiled.invoke` 的"伪 JVM 字节码"大致是（栈视图 `[]` 表示空栈）：
+#### 2.4.3 第二层：KJS 字节码（解释器吃的那份，D3/D4 产物）
 
 ```text
-; ===== prologue =====
-ALOAD  argsArr; ICONST_0; AALOAD; INVOKESTATIC toD → DSTORE 0   ; n  (double)
-DCONST_0 → DSTORE 1                                            ; s = 0.0
-DCONST_0 → DSTORE 2                                            ; i = 0.0
-; ===== loop head (LD_JMP 0) =====
-L_head:
-DLOAD 2; DLOAD 0; DCMPG; IFGE L_end      ; 栈空：i<n ?  (i>=n 跳到结尾)
-; —— body ——
-DLOAD 1; DLOAD 2; DADD; DSTORE 1         ; s = s + i
-DLOAD 2; DCONST_1; DADD; DSTORE 2        ; i = i + 1
-GOTO L_head
-; ===== end =====
-L_end:
-DLOAD 1; ARETURN                        ; return s
+ pc  指令              注释
+  0  LOAD_ZERO         ; 压 0.0
+  1  STORE_LOCAL 1     ; s = 0（注意：KJS 的 STORE_LOCAL 存完把值"留在栈上"）
+  2  POP               ; 语句结束，把留下的那份清掉
+  3  LOAD_ZERO
+  4  STORE_LOCAL 2     ; i = 0
+  5  POP
+  6  LOAD_LOCAL 2      ; ┐
+  7  LOAD_LOCAL 0      ; │ 循环条件 i < n
+  8  LT                ; ┘
+  9  JF 21             ; 条件为假 → 跳出循环
+ 10  LOAD_LOCAL 1      ; ┐
+ 11  LOAD_LOCAL 2      ; │ s = s + i
+ 12  ADD               ; │
+ 13  STORE_LOCAL 1     ; ┘
+ 14  POP
+ 15  LOAD_LOCAL 2      ; ┐
+ 16  LOAD_ONE          ; │ i = i + 1
+ 17  ADD               ; │
+ 18  STORE_LOCAL 2     ; ┘
+ 19  POP
+ 20  JMP 6             ; 回到循环头
+ 21  LOAD_LOCAL 1
+ 22  RET               ; return s
 ```
 
-整段循环里**没有任何对象分配、没有任何数组索引、没有任何分发**，全是原生 `D*`/`GOTO`/`IF*` 指令。对照解释器：解释器每轮循环要走 2 次"读字节码→`when(op)` 分支→访问 `frame.stack`/`frame.locals`"，外加 `toNumber`（如果没被特化）的装箱。
+> 两个容易踩的细节：① `0` 和 `1` 有专用短指令 `LOAD_ZERO`/`LOAD_ONE`（`Compiler.emitNumber`），不走常量池；② `STORE_LOCAL` 是"**存了还留一份**"的语义（因为 `s = 0` 作为表达式也有值），所以每个赋值语句后面都跟一条 `POP`。这条规则会一路传染到 JVM 侧的 `DUP2`/`POP2`。为聚焦主线，上面省略了 `for` 更新段的跳转编排细节。
 
-> 这个端到端例子对应 §7 的"抽象解释如何投票出 double"。可以看到 `s`/`i`/`n` 全程 `DSTORE`/`DLOAD`，正是特化生效的结果。
+#### 2.4.4 第三层：JIT 发射出的 JVM 字节码
+
+`Jit.emitBody` 拿着上面那 23 条 KJS 指令，从头到尾扫一遍，每条**换成一小段固定模板**，就得到下面这些（一行一条指令，标签 `L6`/`L21` 对应 KJS 的 pc）：
+
+```text
+; ========== prologue：把实参搬进局部槽 ==========
+  ALOAD        5                              ; 压 argsArr
+  SIPUSH       0                              ; 压下标 0
+  AALOAD                                      ; 取出 argsArr[0]（长度检查分支略）
+  INVOKESTATIC JitBridge.toD (Object)D        ; 拆箱成原生 double
+  DSTORE       6                              ; n = 实参
+  DCONST_0
+  DSTORE       8                              ; s = 0.0（非参数局部一律先清零）
+  DCONST_0
+  DSTORE       10                             ; i = 0.0
+
+; ========== 循环头（KJS pc=6）==========
+L6:
+  DLOAD        10                             ; 压 i           <- LOAD_LOCAL 2
+  DLOAD        6                              ; 压 n           <- LOAD_LOCAL 0
+  DCMPL                                       ; ┐
+  IFLT         L_true                         ; │
+  ICONST_0                                    ; │ i < n ? 把布尔结果做出来   <- LT
+  GOTO         L_done                         ; │
+L_true:                                       ; │
+  ICONST_1                                    ; │
+L_done:                                       ; ┘
+  IFEQ         L21                            ; 结果为 false → 跳出循环      <- JF 21
+
+; ========== 循环体：s = s + i ==========
+  DLOAD        8                              ; s              <- LOAD_LOCAL 1
+  DLOAD        10                             ; i              <- LOAD_LOCAL 2
+  DADD                                        ; s + i          <- ADD
+  DUP2                                        ; ┐ STORE_LOCAL 的"存完还留一份"
+  DSTORE       8                              ; ┘ s = s + i    <- STORE_LOCAL 1
+  POP2                                        ; 清掉留下的那份  <- POP
+
+; ========== 步进：i = i + 1 ==========
+  DLOAD        10
+  DCONST_1                                    ; 1.0            <- LOAD_ONE
+  DADD
+  DUP2
+  DSTORE       10
+  POP2
+  GOTO         L6                             ;                <- JMP 6
+
+; ========== 出口：return s ==========
+L21:
+  DLOAD        8                              ; 原生 double    <- LOAD_LOCAL 1
+  INVOKESTATIC Double.valueOf (D)Ljava/lang/Double;  ; 必须装箱（见 §2.4.0 的提醒）
+  ARETURN                                     ;                <- RET
+```
+
+右侧 `<- XXX` 标出了每段 JVM 指令**是由哪条 KJS 指令翻译来的**——这就是"模板 JIT"四个字的全部含义：**一条进、一小段出，一一对应，没有重排、没有跨指令优化**。
+
+#### 2.4.5 把栈的变化演一遍：`s = s + i`
+
+假设进入这一轮时 `s = 1.0`（槽 8）、`i = 2.0`（槽 10）。看操作数栈怎么起落（左边是栈底，右边是栈顶）：
+
+| 步 | 指令 | 执行后的 JVM 操作数栈 | 局部槽变化 |
+|---|---|---|---|
+| 1 | `DLOAD 8` | `[1.0]` | — |
+| 2 | `DLOAD 10` | `[1.0, 2.0]` | — |
+| 3 | `DADD` | `[3.0]` | — |
+| 4 | `DUP2` | `[3.0, 3.0]` | — |
+| 5 | `DSTORE 8` | `[3.0]` | 槽 8 = `3.0` |
+| 6 | `POP2` | `[]`（空） | — |
+
+**关键：整个过程里 `1.0`/`2.0`/`3.0` 从头到尾都是原生 64 位浮点，从没变成 `Double` 对象，一次堆分配都没有。** 而解释器跑同样一轮，`stack[sp++] = s + i` 这一步就得 `Double.valueOf(3.0)` 造一个对象出来（§5 第 3 点）。
+
+> `DUP2` + `POP2` 看着像白干活 —— 确实是，它只是为了忠实还原 KJS `STORE_LOCAL` 的"留一份"语义。这类冗余会被 HotSpot C2 在后续优化里直接消掉（§3.3 的第二层 JIT），所以不影响最终机器码。**宁可多发一条冗余指令，也不在发射期做"聪明"的重排** —— 这是保证语义一致的重要取舍（§6）。
+
+#### 2.4.6 这段代码凭什么快
+
+整段循环里**没有任何对象分配、没有任何数组索引、没有任何指令分发**，全是原生 `D*` / `GOTO` / `IF*`。逐项对照：
+
+| 每轮循环要做的事 | 解释器 | JIT 生成代码 |
+|---|---|---|
+| 取下一条指令 | `op = code[pc++]` × 约 15 次 | 无（指令已展开成顺序代码） |
+| 决定执行哪段逻辑 | `when(op)` 大分支（`tableswitch`）× 约 15 次 | 无 |
+| 操作数栈读写 | `frame.stack[sp++]` / `stack[--sp]`，数组下标 + 越界检查 | JVM 原生操作数栈（可进寄存器） |
+| 局部变量读写 | `frame.locals[a]`，对象数组访问 | `DLOAD`/`DSTORE`，直接是槽 |
+| 数值加法 | `toNumber` → `Double.valueOf` 装箱 | 一条 `DADD` |
+| 堆分配 | 每轮若干个 `Double` 对象 | **0** |
+
+> 这个端到端例子同时也是 §7"抽象解释如何投票出 double"的成品展示：正因为 `n`/`s`/`i` 三个局部都被投票为 DOUBLE，才有资格全程走 `DLOAD`/`DSTORE`。只要其中任何一个曾被赋过字符串或对象，它就会被降级成 `Object` 槽，上面那串 `D*` 立刻退化成 `ALOAD` + `JitBridge.add(...)`。
 
 ### 2.5 生成类的生命周期
 
@@ -282,11 +441,11 @@ JIT 必须在**不真正运行**函数的情况下，猜出每个栈位置在每
 
 `emitBody` 维护 `aStack: ArrayDeque<T>`，逐指令更新栈顶类型：
 
-- `LOAD_INT 0` → 压 `DOUBLE`（DCONST_0）
-- 已知 `YES` 的 `LOAD_LOCAL` → 压 `DOUBLE`（DLOAD n）
-- `STORE_LOCAL`（double 槽）→ 弹 `DOUBLE`
-- `ADD`：若栈顶两个都是 `DOUBLE` → `DADD`；否则 → `boxTopTwoForCall` 后调 `bridge.add`
-- `LT`：若两个 `DOUBLE` → `DCMPG` + `IFxx` 得到 `BOOL`；否则 `bridge.lt`
+- `LOAD_ZERO` / `LOAD_ONE` / `LOAD_INT` → 压 `DOUBLE`（`DCONST_0` / `DCONST_1` / `LDC`）
+- 已知 `YES` 的 `LOAD_LOCAL` → 压 `DOUBLE`（`DLOAD slot`）
+- `STORE_LOCAL`（double 槽）→ `DUP2` + `DSTORE`（存完留一份，栈顶仍是 `DOUBLE`）
+- `ADD`：若栈顶两个都是 `DOUBLE` → `DADD`；否则 → `boxTopTwo` 后调 `bridge.add`
+- `LT`：若两个 `DOUBLE` → `DCMPL` + `IFLT` 物化出 `BOOL`；否则 `bridge.lt`（`GT`/`GE` 用 `DCMPG`，差别只在 NaN 的处理方向）
 
 `T` 只有三种：`DOUBLE`（原生双精度）、`BOOL`（原生 `Z`）、`ANY`（装箱 `Object`）。栈深度随 `push`/`pop`（`addLast`/`removeLast`）增减，与 KJS 操作数栈 1:1 对应。
 
@@ -296,16 +455,16 @@ JIT 必须在**不真正运行**函数的情况下，猜出每个栈位置在每
 
 ```mermaid
 flowchart TD
-    A["LOAD_INT 0 (i=0)"] --> B["DCONST_0 · 栈[D]"]
-    B --> C["STORE_LOCAL 2 (i) · DSTORE 2"]
-    C --> D["loop: DLOAD 2; DLOAD 0; DCMPG; IFGE end"]
-    D -->|"i<n"| E["s=s+i: DLOAD 1; DLOAD 2; DADD; DSTORE 1"]
-    E --> F["i++: DLOAD 2; DCONST_1; DADD; DSTORE 2"]
+    A["LOAD_ZERO (i=0)"] --> B["DCONST_0 · 抽象栈[D]"]
+    B --> C["STORE_LOCAL 2 (i) · DSTORE 10"]
+    C --> D["循环头: DLOAD 10; DLOAD 6; DCMPL; IFLT/IFEQ"]
+    D -->|"i&lt;n"| E["s=s+i: DLOAD 8; DLOAD 10; DADD; DSTORE 8"]
+    E --> F["i=i+1: DLOAD 10; DCONST_1; DADD; DSTORE 10"]
     F --> D
-    D -->|"i>=n"| G["return s: DLOAD 1; ARETURN"]
+    D -->|"i&gt;=n"| G["return s: DLOAD 8; Double.valueOf; ARETURN"]
 ```
 
-整段循环里只有 `D*` 与 `GOTO`/`IFGE`——**全程不碰堆、不装箱、不查池**，就是 §5 第 3 点"去装箱"的来源。
+整段循环里只有 `D*` 与 `GOTO`/`IF*`——**全程不碰堆、不装箱、不查池**，就是 §5 第 3 点"去装箱"的来源。唯一一次装箱发生在 `RET`：结果要跨出 `invoke` 边界，必须变回 `Object`（§2.4.0）。
 
 ---
 
