@@ -98,12 +98,13 @@ class Tracer(val out: java.io.PrintStream = System.err) {
     // ---- VM step-by-step ----
     fun onVmEnter(bc: Bytecode) {
         h("4. 字节码执行 (VM)")
-        l("栈机按 pc 顺序逐条执行指令；括号内是「执行后」的栈状态（栈顶在右）。")
+        l("栈机按 pc 顺序逐条执行指令；行内右侧是本指令执行「前」的栈状态与当前局部变量表。")
     }
 
-    fun onVmStep(pc: Int, op: Op, a: Int, b: Int, stackSnapshot: String) {
+    fun onVmStep(pc: Int, op: Op, a: Int, b: Int, stackSnapshot: String, locals: List<Pair<String, String>>) {
         if (!enabled) return
-        l(String.format("   pc=%-3d %-14s a=%-4d   stack = [%s]", pc, op.name, a, stackSnapshot))
+        val loc = if (locals.isEmpty()) "(空)" else locals.joinToString(", ") { "${it.first}=${it.second}" }
+        l(String.format("   pc=%-3d %-14s a=%-4d   stack = [%-30s]  | locals: %s", pc, op.name, a, stackSnapshot, loc))
     }
 
     // ---- Frame lifecycle (each function call creates a VM Frame) ----

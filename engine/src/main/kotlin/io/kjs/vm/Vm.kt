@@ -212,7 +212,7 @@ class Vm(val realm: Realm) {
         val depth = frameDepth
         if (tr != null) tr.onFramePush(bc.name, depth, localTable(f, bc))
         frameDepth++
-        val traceHere = tr != null && frameDepth == 1
+        val traceHere = tr != null
         try {
             val r = runLoop(f, bc, code, aOps, bOps, strings, constants, traceHere)
             if (tr != null) tr.onFramePop(bc.name, depth, r, localTable(f, bc))
@@ -246,7 +246,7 @@ class Vm(val realm: Realm) {
             val pc = f.pc
             val op = OP_VALUES[code[pc]]
             val a = aOps[pc]; val b = bOps[pc]
-            if (traceHere) tracer!!.onVmStep(pc, op, a, b, snapshot(f))
+            if (traceHere) tracer!!.onVmStep(pc, op, a, b, snapshot(f), localTable(f, bc))
             f.pc = pc + 1
             try {
                 when (op) {
