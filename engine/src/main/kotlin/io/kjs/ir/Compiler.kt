@@ -72,6 +72,7 @@ class Compiler private constructor(
         val slot = nextSlot++
         scope.locals[name] = slot
         if (isConst) scope.consts.add(name)
+        bytecode.recordLocalName(slot, name)
         return slot
     }
     /** Returns slot if name is a local in current function's chain of scopes. */

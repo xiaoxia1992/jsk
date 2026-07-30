@@ -208,13 +208,32 @@ class Vm(val realm: Realm) {
         val bc = f.bc
         val code = bc.codeA; val aOps = bc.aOpsA; val bOps = bc.bOpsA
         val strings = bc.strings; val constants = bc.constants
+        val tr = tracer
+        val depth = frameDepth
+        if (tr != null) tr.onFramePush(bc.name, depth, localTable(f, bc))
         frameDepth++
-        val traceHere = tracer != null && frameDepth == 1
+        val traceHere = tr != null && frameDepth == 1
         try {
-            return runLoop(f, bc, code, aOps, bOps, strings, constants, traceHere)
+            val r = runLoop(f, bc, code, aOps, bOps, strings, constants, traceHere)
+            if (tr != null) tr.onFramePop(bc.name, depth, r, localTable(f, bc))
+            return r
         } finally {
             frameDepth--
         }
+    }
+
+    /** Snapshot of the (user-visible) local variable table for the tracer: slot name -> value. */
+    private fun localTable(f: Frame, bc: Bytecode): List<Pair<String, String>> {
+        val names = bc.localNames ?: return emptyList()
+        val out = ArrayList<Pair<String, String>>()
+        for (i in 0 until bc.localCount) {
+            val n = names.getOrNull(i) ?: continue
+            if (n.startsWith("__")) continue   // skip compiler-internal scratch slots
+            val raw = f.locals[i]
+            val v = if (raw is Upvalue) raw.value else raw
+            out.add(n to briefValue(v ?: JsValues.UNDEFINED))
+        }
+        return out
     }
 
     private fun runLoop(

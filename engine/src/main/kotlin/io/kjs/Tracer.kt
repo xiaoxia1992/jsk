@@ -106,6 +106,43 @@ class Tracer(val out: java.io.PrintStream = System.err) {
         l(String.format("   pc=%-3d %-14s a=%-4d   stack = [%s]", pc, op.name, a, stackSnapshot))
     }
 
+    // ---- Frame lifecycle (each function call creates a VM Frame) ----
+
+    /** Called when a new VM Frame is created — i.e. a function call enters the interpreter.
+     *  Prints the frame creation plus the current local variable table. */
+    fun onFramePush(name: String, depth: Int, locals: List<Pair<String, String>>) {
+        if (!enabled) return
+        val pad = "  ".repeat(depth)
+        out.println("${pad}▶ 创建帧 ${name}()   [depth=$depth]")
+        if (locals.isEmpty()) {
+            out.println("${pad}    局部变量表: (空)")
+        } else {
+            out.println("${pad}    局部变量表:")
+            for ((n, v) in locals) out.println("${pad}      ${n} = $v")
+        }
+    }
+
+    /** Called when a VM Frame returns. Prints the result and the final local variable table. */
+    fun onFramePop(name: String, depth: Int, result: Any?, locals: List<Pair<String, String>>) {
+        if (!enabled) return
+        val pad = "  ".repeat(depth)
+        out.println("${pad}◀ 退出帧 ${name}()  => ${fmt(result)}")
+        if (locals.isNotEmpty()) {
+            out.println("${pad}    退出时局部变量表:")
+            for ((n, v) in locals) out.println("${pad}      ${n} = $v")
+        }
+    }
+
+    private fun fmt(v: Any?): String = when (v) {
+        null -> "null"
+        io.kjs.runtime.Undefined -> "undefined"
+        is Boolean, is Double, is Int, is Long -> v.toString()
+        is String -> "\"" + (if (v.length > 24) v.take(24) + "…" else v) + "\""
+        is io.kjs.runtime.JsFunction -> "[fn ${v.get("name")}]"
+        is io.kjs.runtime.JsObject -> "[${v.className}]"
+        else -> v.toString()
+    }
+
     fun onResult(result: Any?) {
         h("5. 结果")
         l("  最终 lastResult = ${JsValues.toStr(result)}")

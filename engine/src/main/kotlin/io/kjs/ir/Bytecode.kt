@@ -36,6 +36,26 @@ class Bytecode(
     /** Total number of locals used by this function (including params). */
     var localCount: Int = 0
 
+    /**
+     * Local variable slot names, indexed by slot number. Used only for tooling/trace
+     * output (so `--trace` can render the local variable table). A null entry at a slot
+     * means the slot is a scratch / compiler-internal slot and should not be shown to users.
+     */
+    var localNames: Array<String?>? = null
+
+    /** Record (or overwrite) the name bound to a local slot. Grows the name array as needed. */
+    fun recordLocalName(slot: Int, name: String) {
+        var arr = localNames
+        if (arr == null) {
+            arr = arrayOfNulls(maxOf(slot + 1, 8)); localNames = arr
+        } else if (slot >= arr.size) {
+            val grown = arrayOfNulls<String>(slot + 1)
+            System.arraycopy(arr, 0, grown, 0, arr.size)
+            localNames = grown; arr = grown
+        }
+        arr[slot] = name
+    }
+
     /** Try-handler table is implicit (via TRY_ENTER in code); kept here for tooling. */
     val handlers = ArrayList<Handler>()
 
