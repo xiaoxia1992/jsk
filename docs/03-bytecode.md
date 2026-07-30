@@ -10,20 +10,23 @@
 VM 是栈式字节码机，`Bytecode`（`Bytecode.kt:12`）把"指令流"与"操作数"分离成三条**等长**车道：
 
 ```kotlin
-12:30:engine/src/main/kotlin/io/kjs/ir/Bytecode.kt
-class Bytecode(val name: String, var paramCount: Int) {
-    val code = mutableListOf<Int>()        // 车道0: opcode 整数
-    val aOps = mutableListOf<Int>()        // 车道1: 操作数 A（多数指令用）
-    val bOps = mutableListOf<Int>()        // 车道2: 操作数 B（少数指令用）
-    var codeA = IntArray(0)                // freeze 后的只读快照（见 §4）
-    var aOpsA = IntArray(0)
-    var bOpsA = IntArray(0)
-    val constants = mutableListOf<Any?>()  // 常量池: 数字/字符串/BigInt…
-    val strings = mutableListOf<String>()  // 字符串池: 属性名/literal
-    val functions = mutableListOf<Bytecode>()  // 子函数池: MAKE_CLOSURE 取用
-    var localCount = 0                     // 本函数的局部槽总数（含参数 + 临时）
-    var caches: Array<Any?>? = null        // 内联缓存槽（按 pc 索引, D7）
-    var upvalueInfo: List<Upvalue> = emptyList()  // 本函数要捕获的 upvalue 来源
+12:44:engine/src/main/kotlin/io/kjs/ir/Bytecode.kt
+class Bytecode(
+    val name: String,
+    val paramCount: Int,
+    val isArrow: Boolean,
+) {
+    val code = ArrayList<Int>()            // 车道0: opcode 整数(编译期可变)
+    val aOps = ArrayList<Int>()            // 车道1: 操作数 A（多数指令用）
+    val bOps = ArrayList<Int>()            // 车道2: 操作数 B（少数指令用）
+    lateinit var codeA: IntArray           // freeze 后的只读快照(见 §4)
+    lateinit var aOpsA: IntArray
+    lateinit var bOpsA: IntArray
+    val constants = ArrayList<Any?>()      // 常量池: Double/Boolean/null/Undefined(不含 String)
+    val strings = ArrayList<String>()      // 字符串池: 名字/literal
+    val functions = ArrayList<Bytecode>()  // 子函数池: MAKE_CLOSURE 取用(见 §4.5)
+    var localCount = 0                     // 本函数的局部槽总数(含参数 + 临时)
+    var caches: Array<Any?>? = null        // 内联缓存槽(按 pc 索引, D7)
 }
 ```
 
@@ -73,13 +76,71 @@ fun patchB(at: Int, b: Int) { bOps[at] = b }   // 回填操作数 B
 ```kotlin
 68:73:engine/src/main/kotlin/io/kjs/ir/Bytecode.kt
 fun freeze() {
-    codeA = code.toIntArray(); aOpsA = aOps.toIntArray(); bOpsA = bOps.toIntArray()
-    constants_n = constants.toTypedArray(); strings_n = strings.toTypedArray(); functions_n = functions.toTypedArray()
+    codeA = code.toIntArray()
+    aOpsA = aOps.toIntArray()
+    bOpsA = bOps.toIntArray()
+    for (f in functions) if (!f::codeA.isInitialized) f.freeze()   // 递归冻结子函数
 }
 ```
 
 `codeA/aOpsA/bOpsA`（`Bytecode.kt:18`）就是 VM 真正读取的车道（见 D5 §8 的 `OP_VALUES[code[pc]]`）。
 `caches` 是**惰性的**（`null` 直到首次 `LOAD_PROP` 才建数组，D5 §10 / D7），故不在 freeze 里初始化。
+
+## 4.5 函数是独立编译单元（为什么主字节码流里看不到子函数）
+
+回到你看到的 `demo-jit-log.js` 那条 trace：顶层 `pc=0 MAKE_CLOSURE a=0` 之后，主字节码流里再也
+没有 `square` 的任何指令，也没有 `x`。这不是引擎"丢了"代码，而是**函数是独立编译单元**这一核心模型：
+
+- 每个 JS 函数（含顶层 program 本身）都编译成**一个独立的 `Bytecode` 对象**（D4 §1）。
+- 子函数的字节码**不内联进父字节码**，而是放进父 `Bytecode` 的 `functions: ArrayList<Bytecode>` 表
+  （`Bytecode.kt:34`）。
+- 父字节码流里，子函数只以一条 `MAKE_CLOSURE a=fnIdx` 出现——`a` 是 `functions` 表下标，运行时据此
+  取出子 `Bytecode` 造闭包（VM 的 `MAKE_CLOSURE` → 读 `bc.functions[a]`）。
+
+所以 `MAKE_CLOSURE a=0` 的含义是"取第 0 号子函数（即 `square`）造个闭包"。`square` 的真实指令和
+局部变量**躺在 `bc.functions[0]` 里，不在顶层 `code` 车道里**。
+
+### 4.5.1 局部变量 `x` 归谁所有
+
+变量名在编译期就被擦成整数槽号（D4 §2），且槽号**只在各自函数的 `locals` 表里有效**：
+
+- `x` 是 `square` 的**形参**，在 `square` 自己的 Bytecode 里占 `locals[0]`。
+- `c` 是 `square` 的 `var`，占 `square.locals[1]`，`square.localCount = 2`。
+- 顶层字节码流里**根本没有 `x`/`c` 这些名字**，只有 `square` 的引用和几个全局名
+  （`square`/`loud`/`console`/`r` 都是 `DECL_GLOBAL`/`LOAD_GLOBAL`）。
+
+一句话：**局部变量是"函数的私有财产"，不会泄露到父字节码流**。要看 `x` 占几号槽，得看 `square` 的
+Bytecode，而不是主 Bytecode。
+
+### 4.5.2 子函数的字节码长什么样（以 `square` 为例）
+
+按编译器规则（D4）推导 `function square(x){ var c=x+1; return x*x+c; }` 的字节码：
+
+```
+=== square/1 locals=2 ===        // paramCount=1, x→slot0, c→slot1
+  pc0  LOAD_LOCAL   0            ; x
+  pc1  LOAD_INT     1            ; 1
+  pc2  ADD                        ; x+1
+  pc3  STORE_LOCAL  1            ; c = x+1
+  pc4  LOAD_LOCAL   0            ; x
+  pc5  LOAD_LOCAL   0            ; x
+  pc6  MUL                        ; x*x
+  pc7  LOAD_LOCAL   1            ; c
+  pc8  ADD                        ; x*x+c
+  pc9  RET                        ; return
+```
+
+对比顶层只有 `MAKE_CLOSURE`/调用指令——`square` 的 10 条指令全在 `bc.functions[0]`。这也解释了
+`demo-jit-log.js` 的注释"`square` 纯算术 → 能被 JIT"：`square` 内部无任何全局访问/属性读写，JIT 可
+整函数类型特化（D8）。
+
+### 4.5.3 怎么看到子函数的真实字节码
+
+调用主 `Bytecode.disasm()` 会**递归打印所有子函数**（`Bytecode.kt:112`：
+`for ((i, f) in functions.withIndex()) sb.append("\n-- fn[$i] --\n").append(f.disasm())`），
+所以输出里的 `-- fn[0] --` 段就是 `square` 的完整反汇编。VM 的 `Tracer` 进入 `CALL` 后的子 `Frame`
+时，也会逐条 trace 子函数的指令——你贴的那段 trace 只列了主 `Frame`，是因为 `CALL square(5)` 直接
+把结果 `31.0` 返回并继续主帧，没有展开子帧日志。
 
 ## 5. 反汇编（disasm）
 
@@ -89,19 +150,19 @@ fun freeze() {
 98:114:engine/src/main/kotlin/io/kjs/ir/Bytecode.kt
 fun disasm(): String {
     val sb = StringBuilder()
-    for (i in codeA.indices) {
-        val op = OP_VALUES[codeA[i]]
-        val a = aOpsA[i]; val b = bOpsA[i]
-        sb.append(String.format("%4d: %-14s a=%-4d b=%-4d", i, op.name, a, b))
+    sb.append("=== $name/$paramCount locals=$localCount ===\n")
+    for (pc in 0 until code.size) {
+        val op = OP_VALUES[code[pc]]
+        sb.append(String.format("%4d  %-14s %5d %5d", pc, op.name, aOps[pc], bOps[pc]))
         when (op) {
-            Op.LOAD_CONST_STR -> sb.append(" ; \"${strings_n[a]}\"")
-            Op.CONST -> sb.append(" ; ${constants_n[a]}")
-            Op.LOAD_LOCAL, Op.STORE_LOCAL -> sb.append(" ; slot $a")
-            Op.JMP, Op.JT, Op.JF -> sb.append(" ; -> $a")
+            Op.LOAD_CONST -> sb.append("   ; ${constants[aOps[pc]]}")
+            Op.LOAD_STR, Op.LOAD_GLOBAL, Op.STORE_GLOBAL, Op.DECL_GLOBAL,
+            Op.LOAD_PROP, Op.STORE_PROP, Op.DELETE_PROP -> sb.append("   ; \"${strings[aOps[pc]]}\"")
             else -> {}
         }
         sb.append('\n')
     }
+    for ((i, f) in functions.withIndex()) sb.append("\n-- fn[$i] --\n").append(f.disasm())
     return sb.toString()
 }
 ```
