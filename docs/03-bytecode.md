@@ -88,7 +88,7 @@ fun freeze() {
 
 ## 4.5 函数是独立编译单元（为什么主字节码流里看不到子函数）
 
-回到你看到的 `demo-jit-log.js` 那条 trace：顶层 `pc=0 MAKE_CLOSURE a=0` 之后，主字节码流里再也
+结合 `demo-jit-log.js` 的执行 trace 来理解：顶层 `pc=0 MAKE_CLOSURE a=0` 之后，主字节码流里再也
 没有 `square` 的任何指令，也没有 `x`。这不是引擎"丢了"代码，而是**函数是独立编译单元**这一核心模型：
 
 - 每个 JS 函数（含顶层 program 本身）都编译成**一个独立的 `Bytecode` 对象**（D4 §1）。
@@ -139,8 +139,7 @@ Bytecode，而不是主 Bytecode。
 调用主 `Bytecode.disasm()` 会**递归打印所有子函数**（`Bytecode.kt:112`：
 `for ((i, f) in functions.withIndex()) sb.append("\n-- fn[$i] --\n").append(f.disasm())`），
 所以输出里的 `-- fn[0] --` 段就是 `square` 的完整反汇编。VM 的 `Tracer` 进入 `CALL` 后的子 `Frame`
-时，也会逐条 trace 子函数的指令——你贴的那段 trace 只列了主 `Frame`，是因为 `CALL square(5)` 直接
-把结果 `31.0` 返回并继续主帧，没有展开子帧日志。
+时，也会逐条 trace 子函数的指令。在 `demo-jit-log.js` 的主帧 trace 中，`CALL square(5)` 直接把结果 `31.0` 返回并继续主帧，子帧日志未被展开，因此表面上看不到 `square` 的内部指令。
 
 ## 5. 反汇编（disasm）
 
