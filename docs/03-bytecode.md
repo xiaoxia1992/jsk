@@ -176,10 +176,10 @@ fun disasm(): String {
 
 - **常量/加载**：`LOAD_UNDEF`、`LOAD_NULL`、`LOAD_TRUE`、`LOAD_FALSE`、`LOAD_ZERO`、`LOAD_ONE`、
   `LOAD_INT`(a=字面值)、`LOAD_CONST`(a=常量池下标)、`LOAD_STR`(a=字符串池下标)。
-- **局部/参数**：`LOAD_LOCAL`(a=槽)、`STORE_LOCAL`(a=槽，弹)、`LOAD_ARG`(a=实参下标)、
-  `STORE_ARG`(a=实参下标，弹)、`LOAD_ARGUMENTS`（按需构造 `arguments` 对象）。
-- **名称解析**：`LOAD_GLOBAL`/`STORE_GLOBAL`(a=名字)、`DECL_GLOBAL`(a=名字，声明 let/const 并弹初值)；
-  `LOAD_UPVAL`/`STORE_UPVAL`(a=闭包 upvalue 下标)。
+- **局部/参数**：`LOAD_LOCAL`(a=槽，压 `locals[a]`)、`STORE_LOCAL`(a=槽，**写槽、留值不弹**)、`LOAD_ARG`(a=实参下标，压 `args[a]`)、
+  `STORE_ARG`(a=实参下标，**写参、留值不弹**)、`LOAD_ARGUMENTS`（按需构造 `arguments` 对象并压栈）。
+- **名称解析**：`LOAD_GLOBAL`/`STORE_GLOBAL`(a=名字，STORE 写全局、**留值不弹**)、`DECL_GLOBAL`(a=名字，声明 let/const **并弹初值**)；
+  `LOAD_UPVAL`(a=闭包 upvalue 下标，压捕获值)/`STORE_UPVAL`(a=闭包 upvalue 下标，**写捕获、留值不弹**)。
 - **属性/下标**：`LOAD_PROP`(a=名字，弹 obj)、`STORE_PROP`(a=名字，栈 `[obj,value]→value`)、
   `LOAD_ELEM`(栈 `[obj,key]→value`)、`STORE_ELEM`(栈 `[obj,key,value]→value`)、
   `DELETE_PROP`(a=名字)、`DELETE_ELEM`(栈 `[obj,key]→bool`)。
@@ -205,6 +205,143 @@ fun disasm(): String {
 
 > 注意：`obj[k]` 这类**动态键**访问走 `LOAD_ELEM`/`STORE_ELEM`（键在栈上），而非虚构的
 > `LOAD_PROP_BYVAL`；展开 `f(...arr)` 在编译期降级为 `fn.apply(this, argsArr)`，无专属 opcode（D4 §9、D5 §17）。
+
+## 6.1 逐指令参考表（栈 / 局部变量 / 池 的精确语义）
+
+> **约定**：
+> - 表内 `…` 表示栈底不动的部分，右侧为栈顶；`[…, x, y] → […, z]` 表示「执行前 / 执行后」。
+> - **KJS 的赋值是一条表达式**：`STORE_*` 系列执行后**把被赋值的值留在栈顶**（VM 用 `peek()` 读取、不 `pop()`），因此独立语句通常要在 `STORE_*` 后紧跟一条 `POP` 把残留清掉（与 08-jit §2.4.3 一致）。`DECL_GLOBAL` 是唯一「弹出初值」的例外。
+> - `locals[槽]` 若存的是 `Upvalue` 包装（闭包捕获），读写走 `raw.value`。
+> - 算术/比较结果类型：数值运算得 `Double`（或 `BigInteger`），比较得 `Boolean`；`ADD` 任一侧为 `String` 时走字符串拼接。
+> - 跳转指令的 `a` 为**绝对 pc**（去 freeze 前由 `patchA` 回填，见 §3）。
+
+### 6.1.1 常量 / 字面量（压栈，无副作用）
+
+| 指令 | A/B | 作用 | 栈变化 | 副作用 |
+|---|---|---|---|---|
+| `NOP` | — | 空操作 | `[…] → […]` | 无 |
+| `LOAD_UNDEF` | — | 压 `undefined` | `[…] → […, undefined]` | 无 |
+| `LOAD_NULL` | — | 压 `null` | `[…] → […, null]` | 无 |
+| `LOAD_TRUE` | — | 压 `true` | `[…] → […, true]` | 无 |
+| `LOAD_FALSE` | — | 压 `false` | `[…] → […, false]` | 无 |
+| `LOAD_ZERO` | — | 压 `0.0` | `[…] → […, 0.0]` | 无 |
+| `LOAD_ONE` | — | 压 `1.0` | `[…] → […, 1.0]` | 无 |
+| `LOAD_INT` | a | 压 32 位整数字面量 `a`（存为 `Double`） | `[…] → […, a.toDouble()]` | 无 |
+| `LOAD_CONST` | a | 压 `constants[a]` | `[…] → […, constants[a]]` | 读常量池 |
+| `LOAD_STR` | a | 压 `strings[a]` | `[…] → […, strings[a]]` | 读字符串池 |
+
+### 6.1.2 局部变量 / 形参 / 全局 / upvalue
+
+| 指令 | A/B | 作用 | 栈变化 | 副作用 |
+|---|---|---|---|---|
+| `LOAD_LOCAL` | a | 压 `locals[a]`（解析 `Upvalue`） | `[…] → […, locals[a]]` | 读 locals |
+| `STORE_LOCAL` | a | `locals[a] = peek()`（写槽，**留值不弹**） | `[…, v] → […, v]` | 写 locals[a] |
+| `LOAD_ARG` | a | 压 `args[a]`，越界压 `undefined` | `[…] → […, args[a]?]` | 读实参数组 |
+| `STORE_ARG` | a | `args[a] = peek()`（写参，**留值不弹**） | `[…, v] → […, v]` | 写 args[a] |
+| `LOAD_ARGUMENTS` | — | 按需构造 `arguments` 对象并压栈 | `[…] → […, argumentsObj]` | 新建数组（来自 `args`） |
+| `LOAD_GLOBAL` | a, b | 压全局变量 `strings[a]`；`b!=0` 时容忍 `undefined` | `[…] → […, global]` | 读全局环境 |
+| `STORE_GLOBAL` | a | 写全局 `strings[a] = peek()`（**留值不弹**） | `[…, v] → […, v]` | 写全局环境 |
+| `DECL_GLOBAL` | a | 声明 `let/const` 并把**初值弹出**（初值来自栈顶） | `[…, v] → […]` | 注册全局绑定 |
+| `LOAD_UPVAL` | a | 压 `upvalues[a].value` | `[…] → […, val]` | 读闭包捕获 |
+| `STORE_UPVAL` | a | `upvalues[a].value = peek()`（**留值不弹**） | `[…, v] → […, v]` | 写闭包捕获 |
+
+### 6.1.3 属性 / 元素 / 对象字面量
+
+| 指令 | A/B | 作用 | 栈变化 | 副作用 |
+|---|---|---|---|---|
+| `LOAD_PROP` | a | 弹 `obj`，压 `obj[strings[a]]` | `[…, obj] → […, value]` | 读属性 |
+| `STORE_PROP` | a | 弹 `val`、弹 `obj`，`obj[strings[a]] = val`，**压回 val** | `[…, obj, val] → […, val]` | 写属性 |
+| `LOAD_ELEM` | — | 弹 `key`、弹 `obj`，压 `obj[key]` | `[…, obj, key] → […, value]` | 读属性（动态键） |
+| `STORE_ELEM` | — | 弹 `val`、弹 `key`、弹 `obj`，`obj[key]=val`，**压回 val** | `[…, obj, key, val] → […, val]` | 写属性（动态键） |
+| `DELETE_PROP` | a | 弹 `obj`，压 `delete obj[strings[a]]`（布尔） | `[…, obj] → […, bool]` | 删属性 |
+| `DELETE_ELEM` | — | 弹 `key`、弹 `obj`，压 `key in obj ? delete : false` | `[…, obj, key] → […, bool]` | 删属性 |
+| `MAKE_OBJECT` | a | 弹 `2a` 个 `(key,val)` 对，压新建 `JsObject` | `[…, k1,v1,…,ka,va] → […, obj]` | 新建对象 |
+| `MAKE_ARRAY` | a | 弹 `a` 个元素，压新建 `JsArray` | `[…, e1,…,ea] → […, arr]` | 新建数组 |
+| `MAKE_CLOSURE` | a | 以 functions[a] 绑定当前闭包环境，压 `VmClosure` | `[…] → […, closure]` | 新建闭包（捕获 env） |
+
+### 6.1.4 栈操作原语
+
+| 指令 | A/B | 作用 | 栈变化 | 副作用 |
+|---|---|---|---|---|
+| `DUP` | — | 复制栈顶 | `[…, v] → […, v, v]` | 无 |
+| `POP` | — | 弹栈顶 | `[…, v] → […]` | 无 |
+| `SWAP` | — | 交换栈顶两元素 | `[…, a, b] → […, b, a]` | 无 |
+
+### 6.1.5 算术 / 一元 / 位运算（二元均弹 2、压 1）
+
+| 指令 | A/B | 作用 | 栈变化 | 副作用 |
+|---|---|---|---|---|
+| `ADD` | — | 弹 `r,l`；若任一为 `String` 则拼接，否则数值加 | `[…, l, r] → […, result]` | 无 |
+| `SUB`/`MUL`/`DIV`/`MOD` | — | 弹 `r,l`，数值运算 | `[…, l, r] → […, result]` | 无 |
+| `POW` | — | 弹 `r,l`，求幂 | `[…, l, r] → […, result]` | 无 |
+| `NEG` | — | 弹 `v`，压 `-v`（BigInteger 取反） | `[…, v] → […, -v]` | 无 |
+| `PLUS` | — | 弹 `v`，压 `toNumber(v)` | `[…, v] → […, num]` | 无 |
+| `NOT` | — | 弹 `v`，压 `!toBool(v)` | `[…, v] → […, bool]` | 无 |
+| `BITNOT` | — | 弹 `v`，压 `~toInt32(v)`（存 Double） | `[…, v] → […, num]` | 无 |
+| `BITAND`/`BITOR`/`BITXOR`/`BITSHL`/`BITSHR`/`BITUSHR` | — | 弹 `r,l`，int32 位运算 | `[…, l, r] → […, num]` | 无 |
+| `TYPEOF` | — | 弹 `v`，压类型字符串 | `[…, v] → […, str]` | 无 |
+| `VOID_OP` | — | 弹 `v`，压 `undefined`（表达式求值副作用） | `[…, v] → […, undefined]` | 无 |
+| `TO_NUMBER` | — | 弹 `v`，压 `toNumber(v)` | `[…, v] → […, num]` | 无 |
+
+### 6.1.6 比较（弹 2、压 1 布尔）
+
+| 指令 | A/B | 作用 | 栈变化 | 副作用 |
+|---|---|---|---|---|
+| `EQ`/`NEQ` | — | 弹 `r,l`，抽象相等/不等 | `[…, l, r] → […, bool]` | 无 |
+| `SEQ`/`SNEQ` | — | 弹 `r,l`，严格相等/不等 | `[…, l, r] → […, bool]` | 无 |
+| `LT`/`LE`/`GT`/`GE` | — | 弹 `r,l`，数值/字典序比较 | `[…, l, r] → […, bool]` | 无 |
+| `INSTANCEOF` | — | 弹 `ctor`、弹 `obj`，压 `obj instanceof ctor` | `[…, obj, ctor] → […, bool]` | 无 |
+| `IN_OP` | — | 弹 `k`、弹 `o`，压 `k in o` | `[…, o, k] → […, bool]` | 无 |
+
+### 6.1.7 控制流 / 跳转（均不改栈深度，除非注明）
+
+| 指令 | A/B | 作用 | 栈变化 | 副作用 |
+|---|---|---|---|---|
+| `JMP` | a | `pc = a` | `[…] → […]` | 改 pc |
+| `JT` | a | 弹 `v`；真则 `pc=a` | `[…, v] → […]` | 改 pc（弹值） |
+| `JF` | a | 弹 `v`；假则 `pc=a` | `[…, v] → […]` | 改 pc（弹值） |
+| `JT_KEEP` | a | 窥栈顶 `v`；真则 `pc=a` 并**保留 v**，否则弹 `v` 顺序执行 | `[…, v] → […, v]`（跳）或 `[…]`（落） | 改 pc |
+| `JF_KEEP` | a | 窥栈顶 `v`；假则 `pc=a` 并**保留 v**，否则弹 `v` 顺序执行 | `[…, v] → […, v]`（跳）或 `[…]`（落） | 改 pc |
+
+### 6.1.8 调用 / 返回 / this
+
+| 指令 | A/B | 作用 | 栈变化 | 副作用 |
+|---|---|---|---|---|
+| `CALL` | a | 弹 `a` 实参 + 弹 `fn`，进入调用，压返回值 | `[…, fn, a1…aN] → […, result]` | 新建/复用 Frame |
+| `CALL_METHOD` | a | 弹 `a` 实参 + 弹 `fn` + 弹 `obj`，`obj.fn(...)`，压返回值 | `[…, obj, fn, a1…aN] → […, result]` | 新建/复用 Frame，`this=obj` |
+| `NEW_OP` | a | 弹 `a` 实参 + 弹 `ctor`，构造实例，压实例 | `[…, ctor, a1…aN] → […, instance]` | 新建/复用 Frame |
+| `RET` | — | 弹栈顶作为函数结果，结束当前 Frame | `[…, v] →`（出帧） | 结束 Frame |
+| `RET_UNDEF` | — | 以 `undefined` 返回，不弹栈 | `[…] →`（出帧） | 结束 Frame |
+| `GET_THIS` | — | 压 `thisVal`（函数则为 `closure.thisVal`，否则 `globalObject`） | `[…] → […, this]` | 无 |
+| `LOAD_ARGUMENTS` | — | 见 §6.1.2（同条） | — | — |
+
+### 6.1.9 异常
+
+| 指令 | A/B | 作用 | 栈变化 | 副作用 |
+|---|---|---|---|---|
+| `THROW` | — | 弹 `v`，抛出 `JsThrown(v)` | `[…, v] →`（抛异常） | 中断执行流 |
+| `TRY_ENTER` | a, b | 压处理器记录（catch=`a`、finally=`b`、当前 sp） | `[…] → […]` | 写 `exceptionHandlers`（handlerTop+=3） |
+| `TRY_EXIT` | — | 弹出处理器记录 | `[…] → […]` | `handlerTop-=3` |
+| `END_FINALLY` | — | 若有挂起异常则重抛，否则无操作 | 视挂起状态而定 | 控制异常传播 |
+
+### 6.1.10 迭代（for-in / for-of）
+
+| 指令 | A/B | 作用 | 栈变化 | 副作用 |
+|---|---|---|---|---|
+| `FOR_IN_INIT` | — | 弹 `obj`，压 key 迭代状态 `IterState` | `[…, obj] → […, state]` | 新建迭代状态 |
+| `FOR_IN_NEXT` | a | 窥 `state`；耗尽则 `pc=a`，否则压下一个 key（指针++） | `[…, state] → […, state, key]`（继续）或跳 `a` | 改 pc |
+| `FOR_OF_INIT` | — | 弹 `obj`，压 for-of 状态 | `[…, obj] → […, state]` | 新建迭代状态 |
+| `FOR_OF_NEXT` | a | 窥 `state`；耗尽则 `pc=a`，否则压下一个 value | `[…, state] → […, state, value]`（继续）或跳 `a` | 改 pc |
+
+### 6.1.11 作用域围栏 / 顶层
+
+| 指令 | A/B | 作用 | 栈变化 | 副作用 |
+|---|---|---|---|---|
+| `PUSH_BLOCK` / `POP_BLOCK` | — | 作用域围栏（当前实现为 no-op） | `[…] → […]` | 仅语义标记，无栈/环境变化 |
+| `STASH_RESULT` | — | 弹栈顶存入 `frame.lastResult`（顶层结果累积） | `[…, v] → […]` | 写 `frame.lastResult` |
+| `HALT` | — | 以 `frame.lastResult` 结束顶层执行（不弹栈） | `[…] →`（停机） | 结束 Realm 执行 |
+
+> 注：`AND_LOG`/`OR_LOG` 在 `Opcode.kt` 中保留但 VM 不发出（逻辑与/或走短路跳转 `JT_KEEP`/`JF_KEEP`），不要期望在字节码里出现。
 
 ## 7. 设计取舍
 
