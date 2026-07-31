@@ -53,6 +53,31 @@ object JsValues {
 > 把强制集中在一处，是"双后端对拍"能成立的前提——VM 的 `ADD`/比较与 Walker 的 `evalBinary` 都调
 > 同一个 `JsValues`，自然一致。
 
+### 2.1 `typeof`：值的"类型标签"
+
+在所有 JS 运算符里，`typeof` 是少数几个对"未声明变量"也不会抛错的——`typeof x` 即使 `x` 从没定义，也只会安心返回 `"undefined"`。它的返回值在 KJS 里由 `JsValues.typeOf`（`JsValue.kt:15`）按 Kotlin 的实际运行类型分发：
+
+| 运行时值 | `typeof` 结果 |
+|---|---|
+| `Undefined`（哨兵单例） | `"undefined"` |
+| `null` | `"object"`（历史遗留：JS 规范里 `null` 的 typeof 就是 object） |
+| `Boolean` | `"boolean"` |
+| `Double` / `Int` / `Long` | `"number"` |
+| `java.math.BigInteger` | `"bigint"` |
+| `String` | `"string"` |
+| `JsFunction` | `"function"` |
+| `JsObject`（`callable != null`） | `"function"` |
+| `JsObject`（其余） | `"object"` |
+
+几点值得留意。第一，`typeof null === "object"` 是 JS 一直没改掉的"老 bug"，KJS 照规范实现（`JsValue.kt:17` 直接返回 `"object"`）。第二，函数本质上也是对象，只因为它身上 `callable` 槽非空，`typeof` 就回报 `"function"`——这和 §3 里"函数即对象"的设定一脉相承。第三，表里那行 `className == "Symbol"` 的分支（`JsValue.kt:25`）是为将来支持 Symbol 预留的：M1 并没有真正提供 `Symbol` 构造器，所以实战里跑不出 `"symbol"`，但值模型层已经给它留好了位置。
+
+### 2.2 `in` 与 `instanceof`：两个依赖值模型的运算符
+
+另外两个常被忽略、但底层都靠值模型的运算符：
+
+- **`in`**：`key in obj` 等价于"obj 自身或其原型链上是否存在名为 key 的属性"。KJS 在 `evalBinary` 里把它转成 `(r as? JsObject)?.has(key)`（`Interpreter.kt:291`），VM 侧则走对象 `has` 的内联缓存路径。`in` 只看"有没有这个属性名"，不关心值是多少。
+- **`instanceof`**：`x instanceof Ctor` 检查的是"x 的原型链上是否出现过 `Ctor.prototype` 这个对象"，而不是检查"类型"。实现是 `protoChainContains(x, Ctor.get("prototype"))`（`Interpreter.kt:292`）：从 `x.proto` 一路向上走，碰到与 `Ctor.prototype` 同一个对象就返回真。正因为比较的是"原型对象身份"，所以用不同 Realm 的构造函数去判断会得到 `false`——这是 `instanceof` 最容易踩坑的地方。
+
 ## 3. JsObject：属性表 + 原型链
 
 JS 并没有传统面向对象语言那种"类继承"机制（ES6 的 `class` 只是语法糖），对象之间是靠一条"原型链"串起来的：访问 `obj.x` 时，如果自己身上没有，就顺着 `__proto__` 往上游找。下面要讲的 `get` 方法，本质就是"沿链向上委托"。作为对比：有些语言选择直接把父类的属性拷贝过来（类式继承），而 JS 选了"链上委托"，更省内存，也允许在运行时动态改原型。
@@ -93,6 +118,16 @@ open class JsObject(var proto: JsObject? = null) {
   字节缓冲的强类型读写（`Int8`…`Float64`），VM 的 `LOAD_ELEM/STORE_ELEM` 透过 `get/set` 自动看到正确值。
 - **`JsProxy`**（`JsObject.kt:68`）：拦截 `get/set/has/deleteProperty/ownKeys` 转发到 handler 的
   trap，未定义 trap 则 `target` 原样处理。这是 ES Proxy 的子集实现。
+
+### 3.2 ToPrimitive 与 `defaultValue`：对象怎么"变"成原始值
+
+当运算符需要把对象当成数字或字符串时（例如 `1 + obj`、`obj == 5`、`String(obj)`），JS 会先调 ToPrimitive 把对象"拆箱"成原始值。KJS 把这件事放在 `JsObject.defaultValue(hint)`（`JsObject.kt:45`）：
+
+- `hint` 是 `"number"` 还是 `"string"`，决定调用 `valueOf` / `toString` 的**顺序**：数字语境先 `valueOf` 后 `toString`，字符串语境反过来（规范如此——因为 `obj + ""` 想要字符串、`+obj` 想要数字）。
+- 候选方法必须是函数、且返回值**不是对象**才被采用，否则继续试下一个；两个都失败也有兜底：返回 `"[object ClassName]"`（`JsObject.kt:55`），所以未重载的对象永远有个字符串表示。
+- `defaultValue` 调用候选方法时传的是 `f.call(this, ...)`（`JsObject.kt:51`）——也就是说拆箱过程中 `this` 指向对象自身，重载 `toString` 时能正常用 `this`（这正是 §5.1 要讲的 `this` 在方法调用里的样子）。
+
+它和 `JsValues.toNumber` / `toStr` 是串起来的：`toNumber(obj)` 最终会落到 `toNumber(obj.defaultValue("number"))`，`toStr(obj)` 同理走 `defaultValue("string")`。于是 `1 + {}` 变成 `1 + "[object Object]"`（数字遇见字符串，整体按字符串拼接），而 `{}.x` 这类表达式的玄学结果，根子往往就在 ToPrimitive 的顺序上。
 
 ## 4. Realm：一次执行会话的全部全局状态
 
@@ -174,6 +209,49 @@ class Environment(val parent: Environment? = null) {
 - `resolveOwner`（`JsFunction.kt:80`）：返回拥有该名的 `Environment`，供 `GlobalIc`（D7 §2）缓存，
   "缓存的是拥有者 map"而非值——所以 `=` 后更新立即可见。
 
+### 5.1 `this` 绑定：函数调用时如何确定 `this`
+
+`this` 大概是 JS 里最容易被人讲玄的概念，但在引擎实现里它一点也不神秘：**`this` 就是函数被调用时、由调用方送进来的"第一个隐含参数"**。它的值完全取决于"这个函数是怎么被调用的"，跟函数定义在哪几乎没有关系——箭头函数除外。
+
+把 `__arrow__` 标记先放一边，看 KJS 支持的四种调用形态各自把什么塞进 `this`：
+
+1. **方法调用 `obj.method(...)`**——`this` 被绑定成 `obj`。
+   - Walker：`evalCall`（`Interpreter.kt:390`）看到被调表达式是 `Member`（即 `obj.method`），就把 `obj` 算出来当作 `thisVal`；对普通函数 `self = thisVal ?: realm.globalObject`（`Interpreter.kt:397`）。
+   - VM：`CALL_METHOD` 从栈上先弹出 `obj`、再弹出 `fn`，`thisRef` 取 `obj`（箭头函数除外，改用 `f.thisVal`）（`Vm.kt:480`）。
+2. **普通调用 `foo(...)`**——没有"点"左边的对象，`thisVal` 是 `null`，于是退化成**全局对象**（KJS 没有严格模式，永远走非严格语义）。
+   - Walker：`thisVal` 为 `null` 时 `self = realm.globalObject`（`Interpreter.kt:397`）。
+   - VM：`CALL` 直接传 `realm.globalObject`（`Vm.kt:472`）。
+3. **构造调用 `new Foo(...)`**——`this` 是一个**全新创建、原型指向 `Foo.prototype` 的空对象**（实例）。构造函数里对 `this` 的赋值，都是在装修这个新家。
+   - Walker：`evalNew`（`Interpreter.kt:401`）先 `JsObject(proto)` 造实例，再 `callee.call(instance, args)`（`Interpreter.kt:406`）。
+   - VM：`NEW_OP`（`Vm.kt:483`）同样造 `instance` 后 `ctor.call(instance, ...)`；若构造函数返回一个对象，则以返回值为准（`if (res is JsObject) res else instance`）。
+4. **`call` / `apply` / `bind`**——由调用方**显式指定** `this`。
+   - `Function.prototype.call(thisArg, ...args)` 把第一个参数当 `this`：`fn.call(arg(args,0), args.drop(1))`（`Intrinsics.kt:77`）。
+   - `apply(thisArg, arrayLike)` 把第二个参数（数组）展开成参数列表（`Intrinsics.kt:87`）。
+   - `bind(thisArg, ...a)` 返回一个新函数，固化 `this` 与前几个参数：`{ _, a -> fn.call(boundThis, boundArgs + a) }`（`Intrinsics.kt:93`）——这是"永久锁定 this"的办法，返回的函数再怎么调用 `this` 都不变。
+
+**箭头函数：词法的 `this`。** 普通函数的 `this` 是"每次调用重新算"，箭头函数则不同——它**不绑定自己的 `this`**，而是沿用定义它时所在的那个 `this`（词法捕获）。实现上有两处配合：
+
+- 创建时打标：箭头函数被标上 `__arrow__`（Walker 路径在 `Interpreter.kt:40`，VM 侧则是 `bc.isArrow` 在 `Vm.kt:85` 处标记）。
+- 调用时不重新设：Walker 的 `callUserFn` 只在**非**箭头时才 `localEnv.declare("this", thisVal)`（`Interpreter.kt:421`）；箭头函数故意不声明 `this` 这个名字，于是 `this` 表达式顺着环境链向上找，撞到的就是外层函数的 `this`。VM 更直接：`CALL_METHOD` / 新建帧时，箭头的 `thisRef` 直接取**外层帧的 `thisVal`**（`Vm.kt:480`、`Vm.kt:184`），新帧的 `thisVal` 就等于外层帧的 `thisVal`。
+
+**引擎里 `this` 到底存在哪？** 两个后端位置不同，但思想一致——`this` 不是普通变量：
+
+- Walker 把它当成局部环境里一个**具名绑定**：进入函数体时 `declare("this", thisVal)`，代码里的 `this` 表达式就是 `env.get("this")`（`Interpreter.kt:203`）。箭头函数"没声明"，于是自然继承外层。
+- VM 把它放在 `Frame` 的**专用字段 `thisVal`** 里（`Vm.kt:56`），`GET_THIS` 指令直接 `f.push(f.thisVal ?: realm.globalObject)`（`Vm.kt:496`），不占 `locals` 格子、也不进 `closure`。这样 `this` 和参数、局部变量在内存里分开了，查找更快。
+
+**顶层 `this`。** 在脚本最外层（不在任何函数里）写 `this`，指向全局对象。`Realm` 初始化时就在全局环境里 `globalEnv.declare("this", globalObject)`（`Realm.kt:20`），并同时挂了 `globalThis` 指向它——所以 `this === globalThis === 全局对象` 在顶层恒成立。
+
+和主流引擎对照：V8 同样把 `this` 当作"调用时传入的隐含参数"，在 Ignition 字节码里用一个专门的寄存器/累加器承载，TurboFan 编译后也只是一个参数槽。KJS 的 VM 用 `Frame.thisVal` 字段，思路完全一样；差异只在 KJS 没有严格模式——真实 JS 在严格模式下普通调用的 `this` 是 `undefined` 而非全局对象，而 KJS 永远给全局对象（见 §7 常见坑）。
+
+### 5.2 `arguments` 对象
+
+在 KJS 里，每个非箭头用户函数被调用时，除了参数，还会拿到一个类数组的 `arguments`：它按索引装着本次调用传进来的全部实参，长度等于实参个数（而非形参个数）。
+
+- Walker：进入 `callUserFn` 时构造 `val arguments = JsArray().apply { args.forEach { push(it) } }`，再 `localEnv.declare("arguments", arguments)`（`Interpreter.kt:428`）。
+- VM：由 `LOAD_ARGUMENTS` 指令现造一个数组，把 `f.args` 依次塞进去（`Vm.kt:497`）。
+
+和真实 JS 一样，KJS 的 `arguments` 是一个**普通 `JsArray`**（不是 ES5 严格模式下那种与形参联动的"神奇数组"——M1 没做联动，改了参数 `arguments` 不一定跟着变，反之亦然）。箭头函数因为在 Walker 里不经历 `callUserFn` 的这套绑定、VM 里也没有自己的 `arguments` 槽，所以箭头函数内部访问 `arguments` 会顺着作用域拿到**外层函数的 `arguments`**——这同样是真实 JS 的行为。
+
 ## 6. 设计取舍
 
 这一节总结全篇的取舍：用 `Any?` 装箱图的是省事，用 `JsValues` 集中处理类型转换是为了让两个后端结果一致，用 `className` 当形状键则是为了驱动内联缓存。每种选择都附了代价说明，M2 是后续的优化方向。
@@ -200,3 +278,4 @@ class Environment(val parent: Environment? = null) {
   （靠 `cachedOwner.hasOwn(name)` 二次校验兜底，D7 §1）。
 - **`closure` 捕获的是 `Environment` 引用**：多个闭包共享同一 `Environment` 即共享其变量，配合
   Upvalue 盒子（D5 §9）实现捕获语义。
+- **`this` 的后端分歧（已知）**：箭头函数的 `this` 在 Walker 经 `evalCall` 取词法 `this`（`Interpreter.kt:397`），而 VM 的 `CALL`（标识符形式的"裸调用"）目前一律传 `realm.globalObject`（`Vm.kt:472`），只有 `CALL_METHOD`（点调用）才会复用外层帧的 `thisVal`（`Vm.kt:480`）。因此"嵌套函数里、以裸标识符调用的箭头函数"，VM 目前会给 `this = 全局对象`，与 Walker 的词法 `this` 不一致——这是 M2 收口双后端语义时要修的点，对拍测试通常走方法调用路径所以暂未暴露。
