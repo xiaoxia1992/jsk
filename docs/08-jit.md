@@ -490,6 +490,44 @@ sum 被调用 → sum 已 JIT → 直接 sum.invoke(...)        （原生 double
 
 关键洞察：**JIT 调用的存在，只是把"调用的发起点"放在了 JVM 栈上**——调用前把实参装箱成 `Object[] argsArr` 透传给运行时即可，**调用方不需要、也不会去组装被调方的 `Frame`**。`add` 的 `Frame` 只在它自己被解释执行的那一刻、由运行时按需组装（且用完归还对象池）。换句话说，JIT 和解释器在"跨函数调用"这件事上共享同一个运行时入口，Frame 的组装规则和纯解释器调解释器**一模一样**，绝不因为调用方是 JIT 而多一份、少一份。
 
+#### 2.6.6 调用链全景：从 JIT 指令到 Frame 组装
+
+上面说"未编译才组装 Frame"，但这一步是怎么被触发的？把 `sum` 的 JIT 代码到 `Vm.kt:174` 之间的每一跳列全（`add` 是普通函数调用、走 `CALL` 而非 `CALL_METHOD`，`thisVal` 是全局对象）：
+
+```text
+sum 的 JIT 代码（JVM 方法 invoke 的内部）
+  │  INVOKESTATIC JitBridge.invokeCall2(args[], callee, vm)   ← §2.6.1 发射的指令
+  ▼
+JitBridge.invokeCall2(args, callee, vm)          [JitBridge.kt:142]
+  │  只是栈顺序变体，内部直接 = invokeCall(vm, callee, args)
+  ▼
+JitBridge.invokeCall(vm, callee, args)           [JitBridge.kt:132]
+  │  vm.invokeFast(fn, vm.realm.globalObject, args)   // 普通调用 thisVal = 全局对象
+  ▼
+Vm.invokeFast(fn, thisVal, argsArr)              [Vm.kt:198]
+  │  val vc = fn.vmClosure as? VmClosure          // 区分 KJS 用户函数 vs 原生函数
+  │  vc != null → execClosureArr(vc, thisVal, argsArr)
+  ▼
+Vm.execClosureArr(c, thisVal, argsArr)           [Vm.kt:132]
+  ├─ c.compiled != null → c.compiled.invoke(...)        // JIT 快路径：不组装 Frame
+  └─ c.compiled == null → 解释器路径                     ← 走到这里（add 还没编译）
+        │  hotness++、达阈值就 requestCompile(c)
+        ▼
+       borrowStack() / borrowLocals() / Frame(...) / runFrame(frame)   [Vm.kt:174-191]
+                                                            ↑ 组装 Frame 的位置
+```
+
+逐跳说明：
+
+1. **`JitBridge.invokeCall2`（`JitBridge.kt:142`）**：纯转发。`sum` 的 JIT 代码把 JVM 栈排成 `[args[], callee, vm]`（这是 `Op.CALL` 发射时定好的顺序），而真正干活的是 `invokeCall(vm, callee, args)`，所以 `invokeCall2` 只是把栈顺序摆正后委托过去。
+2. **`JitBridge.invokeCall`（`JitBridge.kt:132`）**：把 `callee` 强转成 `JsFunction`，并补上 `thisVal = vm.realm.globalObject`——普通函数调用的 `this` 就是全局对象（这是 JS 语义；若是 `CALL_METHOD` 则 `thisVal` 是那个对象，走另一条桥接）。
+3. **`Vm.invokeFast`（`Vm.kt:198`）**：关键分叉。它先看 `fn.vmClosure as? VmClosure`——`add` 是 KJS 用户函数，带 `vmClosure`，于是走 `execClosureArr`；若 `callee` 是原生函数 / bound 函数，则走 `fn.call(...)` 通用路径。
+4. **`Vm.execClosureArr`（`Vm.kt:132`）**：第二步分叉。看 `c.compiled`：
+   - **非空** → 直接 `c.compiled.invoke(...)`，这就是 §2.6.5 说的"已 JIT 不组装 Frame"；
+   - **为空**（`add` 还没编译）→ 进入解释器路径，`borrowStack()` / `borrowLocals()` 借出栈和局部数组，`Frame(bc, stack, locals, closureEnv, upvalues, thisVal, args)` 组装好，参数铺进 `frame.locals[0..paramCount-1]`，最后 `runFrame(frame)` 解释执行。**`Vm.kt:174` 的 Frame 就是在这一跳被构造的。**
+
+> 一句话：**`sum` 的 JIT 代码只发出一条 `invokeCall2`；之后控制权完全交还 KJS 运行时，经过 `invokeCall2 → invokeCall → invokeFast → execClosureArr` 四跳，最终在 `execClosureArr` 发现 `add.compiled == null` 时，才走到解释器路径、按需组装 `Frame`。** JIT 代码本身从不直接碰 `Frame`——它只负责"把调用打包发出去"。
+
 ---
 
 ## 3. 何时运行：变热才编译，下一次调用即走 JIT
