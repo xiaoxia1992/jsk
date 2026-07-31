@@ -462,6 +462,34 @@ sum 被调用 → sum 已 JIT → 直接 sum.invoke(...)        （原生 double
 
 > 一句话：**JIT 函数调用别的 JS 函数 = 在调用边界把原生值装箱、打包成 `Object[]`、通过 `invokeCall2` 桥接回运行时；运行时检查被调函数是否已编译，已编译就直接调它的 `invoke`，否则解释执行并顺手加热度。** 由于始终走运行时分发，`A` 调 `B`、`B` 调 `A`、递归都安全，且 `B` 一旦变热会自动升级、无需重编译 `A`。
 
+#### 2.6.5 那 Frame 呢？调用时还要组装 Frame 吗
+
+**取决于被调函数走哪条路径，与调用方是不是 JIT 无关。** 回到 `Vm.execClosureArr`（`Vm.kt:132`）的两个分支：
+
+- **被调函数已 JIT（`c.compiled != null`）** → 直接 `already.invoke(this, realm, c, thisVal, argsArr)`（`Vm.kt:144`）。这条路径**完全不组装 `Frame`**：被调方自己也是 JVM 栈/槽在跑，闭包捕获变量（`upvalues`）通过 `closure` 参数访问，而不是解释器的 `frame.locals` 数组。调用方 `sum` 这一侧本来就没有 `Frame`（它早已在 JVM 原生栈上执行）。
+
+- **被调函数未编译（解释器路径）** → 才需要组装 `Frame`（`Vm.kt:174-191`）：
+  ```kotlin
+  val stack   = borrowStack()                       // 从对象池借操作数栈
+  val locals  = borrowLocals(localsSize)            // 从对象池借局部数组
+  val frame   = Frame(bc, stack, locals,
+                      closureEnv = c.closureEnv, upvalues = c.upvalues,
+                      thisVal = thisVal, args = argsArr)
+  for (i in 0 until pc) frame.locals[i] = argsArr[i]   // 参数铺进槽 0..paramCount-1
+  return runFrame(frame)
+  ```
+  注意这里 `Frame` 的栈/局部数组是**从对象池 `borrow` 的**（`stackPool`/`localsPool`，`Vm.kt` 有 `releaseStack`/`releaseLocals` 用完归还），目的是压低 GC 压力。
+
+**所以拆解来看"谁有没有 Frame"：**
+
+| 角色 | 走 JIT 快路径时 | 走解释器路径时 |
+|---|---|---|
+| 调用方 `sum`（已 JIT） | 无 `Frame`，用 JVM 栈/槽 | —（它不会走解释器） |
+| 被调方 `add`（已 JIT） | **无 `Frame`**，用 JVM 栈/槽，靠 `closure` 参数取 upvalues | — |
+| 被调方 `add`（未编译） | — | **有 `Frame`**：borrow 栈+局部、绑参数、跑 `runFrame` |
+
+关键洞察：**JIT 调用的存在，只是把"调用的发起点"放在了 JVM 栈上**——调用前把实参装箱成 `Object[] argsArr` 透传给运行时即可，**调用方不需要、也不会去组装被调方的 `Frame`**。`add` 的 `Frame` 只在它自己被解释执行的那一刻、由运行时按需组装（且用完归还对象池）。换句话说，JIT 和解释器在"跨函数调用"这件事上共享同一个运行时入口，Frame 的组装规则和纯解释器调解释器**一模一样**，绝不因为调用方是 JIT 而多一份、少一份。
+
 ---
 
 ## 3. 何时运行：变热才编译，下一次调用即走 JIT
