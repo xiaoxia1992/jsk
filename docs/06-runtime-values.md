@@ -78,6 +78,24 @@ object JsValues {
 - **`in`**：`key in obj` 等价于"obj 自身或其原型链上是否存在名为 key 的属性"。KJS 在 `evalBinary` 里把它转成 `(r as? JsObject)?.has(key)`（`Interpreter.kt:291`），VM 侧则走对象 `has` 的内联缓存路径。`in` 只看"有没有这个属性名"，不关心值是多少。
 - **`instanceof`**：`x instanceof Ctor` 检查的是"x 的原型链上是否出现过 `Ctor.prototype` 这个对象"，而不是检查"类型"。实现是 `protoChainContains(x, Ctor.get("prototype"))`（`Interpreter.kt:292`）：从 `x.proto` 一路向上走，碰到与 `Ctor.prototype` 同一个对象就返回真。正因为比较的是"原型对象身份"，所以用不同 Realm 的构造函数去判断会得到 `false`——这是 `instanceof` 最容易踩坑的地方。
 
+### 2.3 经典面试题拆解：`[] == ![]` 为什么是 true？
+
+这道题几乎出现在每一场 JS 面试里，答案不是"JS 很坑"，而是 `looseEq` 的算法确实会一步步把它算成 `true`。用 KJS 的 `JsValues.looseEq`（`JsValue.kt:92`）走一遍：
+
+**第一步：算 `![]`**。`!` 是逻辑非，先调 `toBool([])`。数组是对象，`toBool` 对对象一律返回 `true`（`JsValue.kt:35`），所以 `!true = false`。式子变成 `[] == false`。
+
+**第二步：类型不同，走 `looseEq` 的抽象相等算法**。左边是 `JsArray`（对象），右边是 `Boolean`。按规范，布尔先转数字：`toNumber(false) = 0`。式子变成 `[] == 0`。
+
+**第三步：对象 × 数字**。`looseEq` 遇到"对象 × 原始值"时，把对象走 `ToPrimitive` 拆箱（`JsValue.kt:98`）：`[]` 调 `defaultValue("number")`，先找 `valueOf`——数组的 `valueOf` 返回数组自身（还是对象），不行；再试 `toString`，`[].toString()` 返回 `""`（空字符串）。式子变成 `"" == 0`。
+
+**第四步：字符串 × 数字**。`looseEq` 把字符串转数字：`toNumber("") = 0`。式子变成 `0 == 0`。
+
+**第五步：同类型数字比较**。`0.0 === 0.0`，`true`。
+
+整个过程：`[] == ![]` → `[] == false` → `[] == 0` → `"" == 0` → `0 == 0` → `true`。如果全程用 `===`，第一步就因类型不同而 `false`，根本走不到后面的拆箱。这就是"能用 `===` 就别用 `==`"的底层原因——`looseEq` 的隐式转换链太长，每一步都可能出意外。
+
+同理可以解释 `'' == false`（`true`）、`'0' == false`（`true`）、`0 == '0'`（`true`）这些"反直觉"结果：它们都是 `looseEq` 算法按规范一步步算出来的，不是 bug。
+
 ## 3. JsObject：属性表 + 原型链
 
 JS 并没有传统面向对象语言那种"类继承"机制（ES6 的 `class` 只是语法糖），对象之间是靠一条"原型链"串起来的：访问 `obj.x` 时，如果自己身上没有，就顺着 `__proto__` 往上游找。下面要讲的 `get` 方法，本质就是"沿链向上委托"。作为对比：有些语言选择直接把父类的属性拷贝过来（类式继承），而 JS 选了"链上委托"，更省内存，也允许在运行时动态改原型。
@@ -129,6 +147,35 @@ open class JsObject(var proto: JsObject? = null) {
 
 它和 `JsValues.toNumber` / `toStr` 是串起来的：`toNumber(obj)` 最终会落到 `toNumber(obj.defaultValue("number"))`，`toStr(obj)` 同理走 `defaultValue("string")`。于是 `1 + {}` 变成 `1 + "[object Object]"`（数字遇见字符串，整体按字符串拼接），而 `{}.x` 这类表达式的玄学结果，根子往往就在 ToPrimitive 的顺序上。
 
+### 3.3 `__proto__` 与 `prototype`：最容易搞混的一对概念
+
+几乎每个学 JS 的人都曾在某个深夜对着这两个词发呆：它们到底什么关系？
+
+- **`__proto__`**（KJS 里对应 `JsObject.proto` 字段）：是**对象身上的一个内部链接**，指向"我的父亲是谁"。当你写 `obj.foo` 而 `obj` 自己身上没有 `foo` 时，引擎就顺着 `obj.proto` 去找。`__proto__` 是**实例**的属性，描述的是"我从谁那继承"。
+- **`prototype`**：是**函数身上的一个普通属性**，指向"我生的孩子该认谁当父亲"。当你 `new Foo()` 时，引擎造出的新实例的 `proto` 就被设成 `Foo.prototype`。`prototype` 是**构造函数**的属性，描述的是"我制造出来的实例该继承谁"。
+
+用 KJS 的代码说就是（`Interpreter.kt:403`）：
+
+```kotlin
+val proto = callee.get("prototype") as? JsObject ?: realm.objectProto
+val instance = JsObject(proto)   // instance.proto = Foo.prototype
+```
+
+`Foo.prototype` 本身也是一个普通对象（`JsObject`），它也有自己的 `proto`——通常指向 `Object.prototype`。所以原型链是：`实例 → Foo.prototype → Object.prototype → null`。
+
+**`Function.prototype` 是个特例**：它本身也是函数（`typeof Function.prototype === "function"`），这是 JS 规范里一个历史遗留的奇怪设计。KJS 里 `functionProto` 的 `callable` 被设为一个空函数，所以 `typeof` 回报 `"function"`。
+
+**`Object.create(null)` 造出的对象没有原型链**：它的 `proto = null`，所以连 `toString`、`hasOwnProperty` 这些 `Object.prototype` 上的方法都没有。在 KJS 里就是 `JsObject(null)`，访问任何属性都直接返回 `UNDEFINED`，不会沿链查找。
+
+### 3.4 `hasOwnProperty` 与 `in`：自有属性 vs 原型链属性
+
+`obj.hasOwnProperty('x')` 和 `'x' in obj` 看起来很相似，实际检查的范围完全不同：
+
+- `hasOwnProperty`（`JsObject.kt:37`）：只查 `properties` 这个自有属性表，**不**看原型链。`obj.hasOwnProperty('toString')` 对普通对象永远返回 `false`，因为 `toString` 在 `Object.prototype` 上，不在对象自己身上。
+- `in`（`Interpreter.kt:291`）：调的是 `obj.has(key)`，先查自有属性，没有就沿 `proto` 链一路向上问。`'toString' in {}` 返回 `true`，因为链上能找到。
+
+这个区别在遍历对象时尤其重要：`for (let k in obj)` 会枚举原型链上的所有可枚举属性（包括继承来的），而 `Object.keys(obj)` 只返回自有属性名。KJS 的 `keys()` 实现（`Intrinsics.kt:35`）就是只读 `properties.keys()`，不碰原型链。
+
 ## 4. Realm：一次执行会话的全部全局状态
 
 `Realm`（`Realm.kt:7`）把所有内置原型、全局对象、全局环境打包，便于创建互相隔离的引擎实例：
@@ -157,6 +204,16 @@ class Realm {
 原型链的"根"是 `objectProto`（`proto = null`）。每个构造器（`Object/Array/...`）在 `install` 时把
 `ctor.prototype` 设为对应 proto，proto 的 `constructor` 指回 ctor，形成标准 JS 原型拓扑。`globalEnv`
 是 `Environment`（见下），`LOAD_GLOBAL` 最终查它（D5 §11）。
+
+### 4.1 Realm 隔离：多实例与跨 Realm 陷阱
+
+`Realm` 的设计目的是**隔离**：每个 `Realm` 有自己独立的全局对象、全局环境和一整套内置原型。在浏览器里，每个 iframe 就是一个独立的 Realm；在 KJS 里，你可以创建多个 `Realm` 实例来模拟这种隔离。
+
+隔离带来的最直接后果是 **`instanceof` 跨 Realm 失效**。假设 Realm A 里有个数组 `arr`，你把它传到 Realm B 去执行 `arr instanceof Array`——结果是 `false`。为什么？因为 B 的 `Array` 构造函数的 `prototype` 是一个**不同的对象**（B 的 `arrayProto`），而 `arr.proto` 指向的是 A 的 `arrayProto`。`protoChainContains` 在 B 的链上永远找不到 B 的 `Array.prototype`，所以返回 `false`。
+
+KJS 的 `Array.isArray()`（`Intrinsics.kt:110`）用 `args.firstOrNull() is JsArray` 直接检查运行时类型，不受 Realm 影响——这就是为什么跨 Realm 时 `Array.isArray(arr)` 比 `arr instanceof Array` 更可靠。
+
+另一个跨 Realm 陷阱是**构造函数判断**：`obj.constructor === Array` 在跨 Realm 时也会失败，因为 `obj.constructor` 指向 A 的 `Array`，而你在 B 里拿到的 `Array` 是另一个对象。`===` 比较的是对象身份，不是"是不是同一个类的概念"。
 
 ## 5. JsFunction 与 Environment：函数与词法作用域
 
@@ -252,6 +309,17 @@ class Environment(val parent: Environment? = null) {
 
 和真实 JS 一样，KJS 的 `arguments` 是一个**普通 `JsArray`**（不是 ES5 严格模式下那种与形参联动的"神奇数组"——M1 没做联动，改了参数 `arguments` 不一定跟着变，反之亦然）。箭头函数因为在 Walker 里不经历 `callUserFn` 的这套绑定、VM 里也没有自己的 `arguments` 槽，所以箭头函数内部访问 `arguments` 会顺着作用域拿到**外层函数的 `arguments`**——这同样是真实 JS 的行为。
 
+### 5.3 `var` 与 `let`：Environment 中的两种变量声明
+
+JS 里 `var` 和 `let` 的行为差异，根源在它们如何与 `Environment` 交互。KJS 的 Walker 后端在 `execStmt`（`Interpreter.kt:86`）里区分处理：
+
+- **`var`**：先经过 `hoist`（`Interpreter.kt:50`）在**当前环境**里预声明为 `undefined`；执行到赋值语句时，如果当前环境已有该名（hoist 时创建的），就 `set` 更新值（`Interpreter.kt:92`）。这意味着 `var` 的作用域是**函数级**的——函数内所有 `var` 都挂在同一个 `Environment` 上，块级 `{}` 挡不住它。
+- **`let`**：不走 hoist，执行到声明语句时直接在**当前环境** `declare`（`Interpreter.kt:95`）。如果当前环境（比如一个块级 `Block` 新建的子环境）已经存在同名变量，会重复声明报错（TDZ 的简化版）。块级 `{}` 在 Walker 里会新建一个 `Environment(env)` 子环境（`Interpreter.kt:76`），`let` 就挂在这个子环境上，出块后子环境销毁，变量自然不可见。
+
+简单说：`var` 是"函数作用域、提升、可重复声明"，`let` 是"块作用域、不提升、不可重复声明"，而 KJS 的实现差异只在"hoist 时是否预声明"和"赋值时走 `set` 还是 `declare`"这两行代码。
+
+**函数声明的提升**也在 `hoist` 里处理（`Interpreter.kt:53`）：遇到 `function foo() {}` 时，立刻用 `mkUserFunction` 创建函数对象并 `env.declare("foo", fn)`。所以函数可以在定义之前调用——这不是魔法，是编译器在跑代码前先把所有函数名登记好了。
+
 ## 6. 设计取舍
 
 这一节总结全篇的取舍：用 `Any?` 装箱图的是省事，用 `JsValues` 集中处理类型转换是为了让两个后端结果一致，用 `className` 当形状键则是为了驱动内联缓存。每种选择都附了代价说明，M2 是后续的优化方向。
@@ -278,4 +346,8 @@ class Environment(val parent: Environment? = null) {
   （靠 `cachedOwner.hasOwn(name)` 二次校验兜底，D7 §1）。
 - **`closure` 捕获的是 `Environment` 引用**：多个闭包共享同一 `Environment` 即共享其变量，配合
   Upvalue 盒子（D5 §9）实现捕获语义。
+- **`0.1 + 0.2 !== 0.3`**：KJS 用 `Double` 表示所有数字，和真实 JS 一样受 IEEE 754 浮点精度限制。`0.1 + 0.2` 在二进制层面无法精确表示，结果是 `0.30000000000000004`。这是语言层面的限制，不是 KJS 的 bug——所有用 `Double`/`f64` 的引擎都一样。
+- **`Function.prototype` 也是函数**：`typeof Function.prototype === "function"` 是规范要求的，KJS 里 `functionProto.callable` 被设为一个空 lambda（`Intrinsics.kt:71`）。这导致一些奇怪现象：你可以写 `Function.prototype()` 调用它（返回 `undefined`），也可以给它加属性——它本质上就是个 callable 的 `JsObject`。
+- **函数 `length` 属性**：`function foo(a, b) {}` 的 `foo.length` 是 `2`，表示形参个数。KJS 在 `mkUserFunction` 时把 `params.size` 存到函数对象的 `length` 属性上（`Interpreter.kt:30` 附近）。注意 `rest` 参数和默认参数会影响这个值，但 M1 的 Walker 不支持复杂参数模式。
+- **`Object.create(null)` 的对象没有 `toString`**：`proto = null` 意味着它不在任何原型链上，所以 `obj.toString` 直接返回 `undefined`，而不是 `"[object Object]"`。这在用对象当字典（hash map）时很有用——不用担心键名和原型链上的方法冲突。
 - **`this` 的后端分歧（已知）**：箭头函数的 `this` 在 Walker 经 `evalCall` 取词法 `this`（`Interpreter.kt:397`），而 VM 的 `CALL`（标识符形式的"裸调用"）目前一律传 `realm.globalObject`（`Vm.kt:472`），只有 `CALL_METHOD`（点调用）才会复用外层帧的 `thisVal`（`Vm.kt:480`）。因此"嵌套函数里、以裸标识符调用的箭头函数"，VM 目前会给 `this = 全局对象`，与 Walker 的词法 `this` 不一致——这是 M2 收口双后端语义时要修的点，对拍测试通常走方法调用路径所以暂未暴露。
