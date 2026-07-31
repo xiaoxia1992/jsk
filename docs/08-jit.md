@@ -388,6 +388,82 @@ flowchart TD
 
 ---
 
+### 2.6 JIT 函数如何调用别的 JS 函数（跨函数调用）
+
+`sum` 这个例子里函数体是"自包含的"，但真实代码里 JIT 函数经常会调用别的函数：`s = add(s, i)`。这里有个关键设计问题：**编译 `sum` 的时候，引擎并不知道 `add` 有没有被 JIT 编译**（可能 `add` 还没变热，甚至根本没被调用过）。所以 JIT 生成的代码**不能硬编码跳转到 `add` 的 JVM 方法**，而是必须"桥接回运行时"，由运行时在**调用那一刻**决定走哪条路径。
+
+#### 2.6.1 JVM 侧：把调用打包成一次普通的 Java 调用（`Op.CALL`，`Jit.kt:750`）
+
+`CALL` 指令在 JIT 里同样走模板，但有两条硬约束：`argc` 必须 `≤ 4`（`MAX_JIT_CALL_ARGC`，`Jit.kt:130`），否则整个函数被拒绝 JIT（因为多参数的装箱组合会爆炸）。发射步骤如下（以 `add(s, i)`、`argc=2` 为例）：
+
+1. **把调用边界上的值装箱**：栈顶的 `s`、`i` 之前是原生 `double`，但在进入另一个 JS 函数前必须变回 `Object`（`Double.valueOf`）——这和 §2.4.0 返回值装箱是同一道"跨函数边界必须走 Object 世界"的门槛。
+2. **打包实参**：`JitBridge.argsOf2(arg0, arg1)` 把两个实参打包成 `Object[]`，`callee`（被调函数对象）留在栈上。
+3. **整理栈并调桥接方法**：`SWAP` 换位、`ALOAD 1`（压 `vm`，槽 1）后，调用 `JitBridge.invokeCall2(args[], callee, vm)`——这就是一次普通的 Java 静态方法调用，**控制权交回 KJS 运行时**。
+
+```text
+; —— s = add(s, i) 在 sum 的 JIT 代码里如何发射（argc=2）——
+  DLOAD 8                ; s（原生 double，槽 8）
+  INVOKESTATIC Double.valueOf        ; ① 装箱！调用边界必须变回 Object
+  DLOAD 10               ; i（原生 double，槽 10）
+  INVOKESTATIC Double.valueOf        ; ① 装箱
+  ALOAD <add 的 closure> ; 压 callee（add 的函数对象，从常量/槽取）
+  INVOKESTATIC JitBridge.argsOf2 (Object,Object)Object[]   ; ② 打包 args[]
+  SWAP                   ; callee 与 args[] 交换
+  ALOAD 1                ; 压 vm（槽 1）
+  INVOKESTATIC JitBridge.invokeCall2 ([Object,Object,Vm)Object   ; ③ 进入运行时
+  ; 返回值 Object 回到 sum 栈上（若 add 返回 double，此处再 toD 拆箱回原生 DSTORE 8）
+```
+
+#### 2.6.2 运行时侧：统一分发（`Vm.execClosureArr`，`Vm.kt:132`）
+
+`invokeCall2` 最终落到 `execClosureArr(callee, thisVal, argsArr)`，它做的事情非常干脆：
+
+```kotlin
+val already = c.compiled
+if (already != null) {
+    return already.invoke(this, realm, c, thisVal, argsArr)   // 走 B 的 JIT 代码
+}
+// 否则解释器路径，hotness++，达阈值就 requestCompile(c)
+```
+
+也就是说：**被调函数 `add` 若已编译 → 直接调它的 `invoke`（第二层 JIT 甚至能把这次调用内联掉）；若还没编译 → 解释执行 `add`，同时给它加热度，变热后自动升级成 JIT。** `sum` 这边完全不用重编译。
+
+#### 2.6.3 这意味着什么
+
+- **递归 / 互相调用都安全**：`sum` 调 `add`、`add` 调 `sum`、函数调自身，都走同一条运行时分发，不存在"跳错代码"的可能。
+- **被调函数自动升级**：`add` 一开始是解释执行，被 `sum` 反复调用变热后就会被 JIT 编译；下次 `sum` 再调 `add`，运行时自动走快路径，而 `sum` 的机器码一行没动过。
+- **代价在哪里**：调用边界要**装箱**（`double→Double`）+ **打包 `Object[]`** + **一次 Java 方法调用** + **运行时分发判断**。这比 JIT 函数体内部（全原生、零堆分配）慢不少，但比"调用方也是解释器"快得多——因为 `sum` 本身已经是 JIT 的，只有跨函数那一跳走 Object 世界。
+
+#### 2.6.4 完整 demo
+
+```js
+function add(a, b) { return a + b; }   // 被调用的函数（callee）
+function sum(n) {
+  var s = 0;
+  for (var i = 0; i < n; i++) {
+    s = add(s, i);                      // ← JIT 函数体内调用另一个 JS 函数
+  }
+  return s;
+}
+```
+
+执行 `sum(1000)` 时的真实路径：
+
+```
+sum 被调用 → sum 已 JIT → 直接 sum.invoke(...)        （原生 double 跑循环）
+   └─ 循环里遇到 add(s, i)
+        └─ sum 的 JIT 代码：装箱 s,i → argsOf2 → invokeCall2(...)
+             └─ 运行时 execClosureArr(add, ...)
+                  ├─ 第 1 次：add 未编译 → 解释执行 add（hotness=1）
+                  ├─ … 反复调用，hotness 累积 …
+                  ├─ 达阈值：requestCompile(add) → add 变 JIT
+                  └─ 之后：add 已编译 → 直接 add.invoke(...)（走 JIT 快路径）
+```
+
+> 一句话：**JIT 函数调用别的 JS 函数 = 在调用边界把原生值装箱、打包成 `Object[]`、通过 `invokeCall2` 桥接回运行时；运行时检查被调函数是否已编译，已编译就直接调它的 `invoke`，否则解释执行并顺手加热度。** 由于始终走运行时分发，`A` 调 `B`、`B` 调 `A`、递归都安全，且 `B` 一旦变热会自动升级、无需重编译 `A`。
+
+---
+
 ## 3. 何时运行：变热才编译，下一次调用即走 JIT
 
 ### 3.1 触发阈值
