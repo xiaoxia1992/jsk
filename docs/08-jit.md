@@ -165,11 +165,11 @@ function sum(n) {
 ```text
  pc  指令              注释
   0  LOAD_ZERO         ; 压 0.0
-  1  STORE_LOCAL 1     ; s = 0（注意：KJS 的 STORE_LOCAL 存完把值"留在栈上"）
-  2  POP               ; 语句结束，把留下的那份清掉
+  1  STORE_LOCAL 1     ; s = 0：把栈顶 0.0 存进槽 1，但"赋值表达式的值"仍留在栈顶（见脚注②）
+  2  POP               ; 这条 var 语句用不到赋值结果 → 弹掉残留的 0.0，栈恢复平衡
   3  LOAD_ZERO
-  4  STORE_LOCAL 2     ; i = 0
-  5  POP
+  4  STORE_LOCAL 2     ; i = 0：同上，赋值值留栈顶
+  5  POP               ; 弹掉残留 0.0
   6  LOAD_LOCAL 2      ; ┐
   7  LOAD_LOCAL 0      ; │ 循环条件 i < n
   8  LT                ; ┘
@@ -177,19 +177,19 @@ function sum(n) {
  10  LOAD_LOCAL 1      ; ┐
  11  LOAD_LOCAL 2      ; │ s = s + i
  12  ADD               ; │
- 13  STORE_LOCAL 1     ; ┘
- 14  POP
+ 13  STORE_LOCAL 1     ; ┘ 赋值值仍留栈顶
+ 14  POP               ; 弹掉残留值
  15  LOAD_LOCAL 2      ; ┐
  16  LOAD_ONE          ; │ i = i + 1
  17  ADD               ; │
- 18  STORE_LOCAL 2     ; ┘
- 19  POP
+ 18  STORE_LOCAL 2     ; ┘ 赋值值仍留栈顶
+ 19  POP               ; 弹掉残留值
  20  JMP 6             ; 回到循环头
  21  LOAD_LOCAL 1
  22  RET               ; return s
 ```
 
-> 两个容易踩的细节：① `0` 和 `1` 有专用短指令 `LOAD_ZERO`/`LOAD_ONE`（`Compiler.emitNumber`），不走常量池；② `STORE_LOCAL` 是"**存了还留一份**"的语义（因为 `s = 0` 作为表达式也有值），所以每个赋值语句后面都跟一条 `POP`。这条规则会一路传染到 JVM 侧的 `DUP2`/`POP2`。为聚焦主线，上面省略了 `for` 更新段的跳转编排细节。
+> 两个容易踩的细节：① `0` 和 `1` 有专用短指令 `LOAD_ZERO`/`LOAD_ONE`（`Compiler.emitNumber`），不走常量池；② **每个 `STORE_LOCAL` 后面为什么都有一条 `POP`？** 因为 KJS 把"赋值"当成一条**有返回值的表达式**：`s = 0` 这个表达式本身的值就是 `0`。所以 `STORE_LOCAL` 的语义是"把值存进槽、**同时把那个值留在栈顶**"，以便支持链式赋值 `a = b = 0`（`b = 0` 返回 0，紧接着 `a = 0` 复用它）。但当 `var s = 0;` 或 `s = s + i` 作为**一条独立的语句**出现时，赋值结果没人要，必须 `POP` 掉——否则栈上会越堆越多残留值，污染后面的指令。反例：`return s = 0;` 或 `foo(s = 0)` 里，`s = 0` 的值要当返回值 / 参数用，那里就**不会**有 `POP`。这套"留一份 + 清残留"机制一路传染到 JVM 侧：`DUP2`（留一份）配 `POP2`（清残留），见 §2.4.4。为聚焦主线，上面省略了 `for` 更新段的跳转编排细节。
 
 #### 2.4.4 第三层：JIT 发射出的 JVM 字节码
 
