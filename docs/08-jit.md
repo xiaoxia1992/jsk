@@ -147,6 +147,8 @@ JVM 和 KJS 一样是**栈机（stack machine）**：指令里不写寄存器名
 | `s` | 1 | DOUBLE | **8**（吃掉 8、9） |
 | `i` | 2 | DOUBLE | **10**（吃掉 10、11） |
 
+> 快速推算公式：**`JVM槽 = 6 + KJS槽号 × 2`**。`6` 是 `this` + 5 个参数占掉的起始位置；`×2` 因为 `double` 在 JVM 里是 64 位、占 2 个槽。代入 `sum`：`n`(0)=6、`s`(1)=8、`i`(2)=10，与上面完全吻合。这也解释了为什么 `s`(槽 8) 夹在 `n`(槽 6) 和 `i`(槽 10) 中间、而不是紧挨着——每跳一个 double 局部，槽号 +2。
+
 #### 2.4.2 第一层：原始 JS
 
 ```js
@@ -214,6 +216,13 @@ function sum(n) {
   DSTORE       8                              ; s = 0.0（非参数局部一律先清零）
   DCONST_0
   DSTORE       10                             ; i = 0.0
+
+; —— 槽号速查（推算公式见 §2.4.1：JVM槽 = 6 + KJS槽号×2，因为 double 占 2 个 JVM 槽）——
+;    n : KJS 槽 0 → JVM 槽 6    （DLOAD/DSTORE 6）
+;    s : KJS 槽 1 → JVM 槽 8    （DLOAD/DSTORE 8）
+;    i : KJS 槽 2 → JVM 槽 10   （DLOAD/DSTORE 10）
+;    槽 0-5 被 this + 5 个参数(vm/realm/closure/thisVal/argsArr) 占掉，KJS 局部从 6 起排。
+;    所以下面循环条件 `i < n` 先 DLOAD 10（i）再 DLOAD 6（n）；`s = s + i` 是 DLOAD 8 再 DLOAD 10。
 
 ; ========== 循环头（KJS pc=6）==========
 L6:
