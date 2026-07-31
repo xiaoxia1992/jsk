@@ -1,59 +1,46 @@
-# KJS 引擎架构（M1）
+# KJS 引擎架构（白话版）
 
-```
-         源代码
-           │
-         Lexer (手写)
-           │  tokens
-         Parser (递归下降)
-           │  AST
-         Interpreter  ──→ Realm (globals/intrinsics)
-           │                │
-         运行时值          Environment (lexical scope)
-                            │
-                         JsObject / JsArray / JsFunction
-```
+这篇用大白话讲清楚 KJS 由哪些部件组成、各自管什么。先把"引擎"想象成一个**翻译+执行流水线**的工厂。
 
-## 值表示（M1 简版）
-| JS 类型 | 宿主表示 |
+## 一条流水线的五个工位
+
+| 工位 | 干什么 | 输入 → 输出 |
+|---|---|---|
+| 词法 Lexer | 把源码文字切成"词"（数字、符号、关键字…） | 文本 → 词列表 |
+| 语法 Parser | 把词整理成"语法树"（谁先算、谁属于谁） | 词列表 → 语法树 |
+| 编译器 Compiler | 把语法树翻译成字节码清单 | 语法树 → 字节码 |
+| 字节码 Bytecode | 就是那份"中间菜谱"（三条并排的数字清单，见字节码篇） | — |
+| 虚拟机 VM | 照字节码一步步执行，数字放"盘子"里 | 字节码 → 运行结果 |
+
+（还有一个对照工位"树遍历解释器 Walker"：不翻译、直接边读语法树边执行，用来和编译器结果对拍、验证正确性。）
+
+## JS 里的各种"值"在内部长啥样
+
+你写的 JS 值，在 KJS 内部用 Kotlin 的类型装起来：
+
+| JS 里写的 | KJS 内部用 |
 |---|---|
-| number | `Double`（整型也存为 Double，向 ES 对齐） |
-| string | `String` |
-| boolean | `Boolean` |
-| null | `null` |
-| undefined | `Undefined` 单例 |
-| object | `JsObject` |
-| array | `JsArray`（`JsObject` 子类） |
-| function | `JsFunction`（`JsObject` 子类，`callable == this`） |
+| 数字 `3`、`3.14` | `Double`（浮点数，整数也当小数存） |
+| 字符串 `"hi"` | `String` |
+| 布尔 `true` / `false` | `Boolean` |
+| `null` | 就是 `null` |
+| `undefined` | 一个专门的 `Undefined` 标记 |
+| 对象 `{...}` | `JsObject`（一个"属性 → 值"的盒子） |
+| 数组 `[...]` | `JsArray`（JsObject 的一种） |
+| 函数 `function(){}` | `JsFunction`（JsObject 的一种，可被调用） |
 
-> M2 将切到 NaN-boxed `Long` 表示，字节码 VM 直接操作 `LongArray` 栈，GC 压力更小。
+## 几个必须知道的概念（都先给大白话）
 
-## 作用域
-`Environment` 是一条父指针链表；每个函数调用、`let/const` 块、`for` 头都会新建一层。变量查找是线性扫描；M2 用编译期 slot 分配替换掉 HashMap，IC 命中时 `O(1)`。
+- **作用域（scope）**："一个变量在哪段代码里看得见"。KJS 用一条"父指向子"的链记录：每进入一个函数或一块 `{}`，就新叠一层；找变量时从里往外找。
+- **闭包（closure）**："内层函数记住了外层函数的变量"。比如外层定义了 `x`，内层函数以后还能用 `x`——KJS 把被记住的变量装进一个"共享盒子"，所有闭包看同一个盒子（详见虚拟机篇）。
+- **异常（throw / try）**：出错时，KJS 用一个"处理器栈"记录当前有哪些 `try` 在等着接住错误，出错就沿着这个栈找 `catch` / `finally`。
+- **原型链（prototype）**：对象找不到某个属性时，会沿着它的"原型"一路向上找，像家族继承。
+- **内联缓存（IC）**：属性访问很频繁，KJS 会"记性很好"地缓存"上次这个属性在哪儿找到的"，下次直接去那，省得每次从头找。
 
-## 异常控制流
-- `throw` → `JsThrown(value)`（RuntimeException）
-- `break/continue/return` 用一次性 RuntimeException，`fillInStackTrace()` 返回 `this`，消除开销。
-- `try/catch/finally` 严格按规范顺序交接控制。
+## 内置功能怎么装进去
 
-## 原型链
-- `Realm` 持有所有 intrinsic proto：`objectProto / arrayProto / functionProto / stringProto / numberProto / booleanProto / errorProto`
-- 取属性时先查 own，再沿 `proto` 链上溯。
+`console`、`Math`、`Object`、`Array` 这些不是你写的，是引擎启动时按固定顺序一个个装好的（先有 `Object`，才有依赖它的 `Function`、`Array`……）。它们都住在"全局环境"里。
 
-## Intrinsics 安装顺序
-`Object → Function → Array → String → Number → Math → JSON → Errors → console → globals`。顺序有意义：`Function.prototype.call/apply/bind` 依赖 `Function` 本身存在。
+## 这套文档怎么读
 
-## 代码导航
-- `lex/Lexer.kt`：词法，含 regex 歧义消解
-- `parse/Parser.kt`：递归下降
-- `parse/Ast.kt`：节点
-- `runtime/Interpreter.kt`：`exec/evalExpr` 两大主循环
-- `runtime/Intrinsics.kt`：内置对象装配
-- `runtime/Realm.kt`：引擎全局状态
-- `Engine.kt`：对外 API
-
-## 下一步（M2 前置）
-1. 新增 `ir/Opcode.kt`：定义 60 条字节码
-2. 新增 `ir/Compiler.kt`：AST → `Bytecode`（常量池 + 字节数组）
-3. 新增 `vm/Interpreter.kt`：`while (true) switch(op)` 大循环
-4. 把 `Engine.eval` 切到 VM，保留 tree-walker 作为 `--walker` 选项以便对拍
+建议顺序：本篇（地图）→ 字节码（清单长啥样）→ 编译器（清单怎么来）→ 虚拟机（清单怎么跑）→ 值模型 / IC / JIT（加速与细节）。每篇都从最简单的讲起。
