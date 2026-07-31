@@ -1,5 +1,10 @@
 # D10 · 内置函数与 CLI
 
+> **写给小白（本章导读）**：**内置函数**就是 JS "自带的函数"，比如 `console.log`、`Array.prototype.map`、`JSON.parse`、`Math.sqrt`。这一章讲它们是怎么"挂进" KJS 引擎的，以及命令行怎么驱动引擎。
+> - **基础信息**：在 KJS 里，一个内置函数就是一个用 Kotlin 写的 lambda，外面套一层 `JsFunction.native(...)` 包装成 JS 函数。VM 调用任何函数都走同一条路，不分"你写的"还是"引擎自带的"，所以加一个内置 = 写个 lambda 挂到全局对象或某个原型上，**完全不用改编译器或 VM**。
+> - **别的方案对比**：① 把内置写死进字节码/VM（如把 `console.log` 当特殊 opcode）——快但难扩展；② 用宿主语言注册（KJS 的做法，灵活、零侵入）；③ 用 JS 自身实现内置（如用 JS 写 `map`）——纯但慢、且启动依赖。KJS 选②，把核心库和扩展库拆成两层文件保持可读。
+> - **进阶**：§3.1 看 `for-of` 怎么靠"迭代协议"统一数组/Map/Set 的遍历；§3.3 注意 Promise 目前是"同步模拟"的已知简化。
+
 > 前置知识：D5（VM）、D6（值模型）、D9（双后端）。
 >
 > 本篇拆解 `runtime/Intrinsics.kt`、`runtime/IntrinsicsExt.kt`、`runtime/KjsNamespace.kt` 与
@@ -7,6 +12,8 @@
 > 命令行与 REPL 如何驱动引擎。读完能理解"宿主功能如何零侵入地挂进 VM"。
 
 ## 1. 核心机制：内置就是 `JsFunction.native`
+
+> **小白讲解**：核心就一句：内置 = 一个 `native` 函数（Kotlin lambda 包成 JS 函数）。VM 的 `CALL` 不区分用户函数和宿主函数，都走 `JsFunction.call`。所以"挂载内置"只是 `target.set("map", nativeFn)`，干净利落。
 
 所有内置函数都是 `JsFunction.native(name, arity, lambda)`（`D6 §5`）——一个 Kotlin lambda 包成 JS 函数。
 VM 的 `CALL`/`CALL_METHOD` 调用任何 `JsFunction` 时都走 `JsFunction.call`（`D5 §4`），**不区分用户函数
@@ -132,6 +139,8 @@ KJS 可嵌入性的核心。
 
 ## 5. CLI / REPL（Main.kt）
 
+> **小白讲解**：命令行入口极简：`kjs 文件.js` 读文件执行、`kjs -e '代码'` 执行内联代码、空参数进 REPL 交互。最有用的是 `kjs --trace -e '...'`——把"词法→语法→编译→VM 步进"全程打印，是边读文档边看真实执行流的最佳方式。
+
 `cli/Main.kt` 是极简入口，演示如何驱动 `Engine`：
 
 ```kotlin
@@ -156,6 +165,8 @@ fun main(args: Array<String>) {
 - `runCode`/`repl` 都捕获 `JsThrown` 打印 `"Uncaught ..."`，与 `Engine.evalToString` 一致（`D0 §4`）。
 
 ## 6. 设计取舍
+
+> **小白讲解**：总结：内置用 native 函数（零侵入）、核心库与扩展库分层、迭代协议统一、Promise 同步化（已知简化）、CLI 极简。代价是 Promise 时序非标准、扩展库要手动维护。
 
 - **内置 = native JsFunction**：统一走 `JsFunction.call`，VM 无需特判，扩展内置零侵入。
 - **两层库分离**：`Intrinsics`（M1 核心）与 `IntrinsicsExt`（ES2015+）分开，核心保持可读。

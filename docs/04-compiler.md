@@ -39,6 +39,8 @@ class Compiler private constructor(
 
 ## 2. 作用域与槽位分配（核心原理一）
 
+> **小白讲解**：**槽位（slot）** = 给局部变量编的"第几号格子"。JS 里变量名是给人看的，机器只认编号。编译器扫描函数体，把 `var/let/参数` 依次分配到 `locals[0]`、`locals[1]`……，后面生成的字节码里就只写"读第 0 号格子、写第 1 号格子"。这样栈式虚拟机不用记名字、直接按编号存取，又快又省。
+
 局部变量不按名字引用，而是**编译期分配一个整数"槽号"**，运行时就是 `Frame.locals[槽]`（D5 §5）。
 本小节系统阐述局部变量的识别方式、编译期与运行期各自的处理、槽位是否会复用与如何申请，以及局部变量表大小如何确定。
 
@@ -228,6 +230,8 @@ private fun hoistVarAndFunctions(body: List<Stmt>, isTopLevel: Boolean) {
 - 顶层（程序根）的 `var`/函数声明 `isTopLevel=true`，不占局部槽、改走 `DECL_GLOBAL`（全局环境，D5 §11）。
 
 ## 5. 跳转修补（核心原理四）
+
+> **小白讲解**：这是编译器四个大招里最绕的一个，但本质很简单：写 `if/for` 的跳转指令时，目标行号还不知道，先 `emit` 一个占位跳转（目标填 0），等把"then 分支 / 循环体"编译完、知道结尾在第几行后，用 `patchA` 把占位回填成真行号。详见 D3 §3 的比喻（写菜谱"转到第 ___ 步"）。
 
 `compileIf/compileWhile/compileForC`（`Compiler.kt:672`）用 `emit(JF/JMP, 0)` 占位 + `patchA` 回填。
 以 `if` 为例：

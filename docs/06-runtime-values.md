@@ -1,11 +1,18 @@
 # D6 · 运行时值模型 Runtime Values
 
+> **写给小白（本章导读）**：这一章讲 KJS 内部"值"长什么样——JS 里的数字、字符串、对象、函数，在 KJS 的实现里到底用什么装。
+> - **基础信息**：JS 只有几种值类型：number/string/boolean/null/undefined/object（含数组、函数）。KJS 用 Kotlin 的 `Any?`（"什么都能装的盒子"，类似 Java 的 `Object`）来统一装这些值，数字用 `Double`（双精度浮点），对象用 `JsObject`。
+> - **别的方案对比**：① 有的 JS 引擎用 **NaN-boxing**（把值塞进一个 64 位整数里，利用"NaN 的位模式很特殊"来标记非数字），省内存但难写；② 有的用"带标签的指针"（指针里借几位当类型标签）。KJS 选了最简单的 `Any?` 装箱——实现容易、读起来直观，代价是数字也要走对象、占内存多一点（M2 计划换 NaN-boxing）。
+> - **进阶**：§3 讲对象怎么通过"原型链"找属性（JS 继承的秘密），§5 讲函数和作用域（闭包的地基）。
+
 > 前置知识：D0（总览）、D5（VM）。
 >
 > 本篇拆解 `runtime/` 下的 `JsValue`/`JsObject`/`Realm`/`JsFunction`/Environment：KJS 用什么表示
 > JS 的"值"，原型链如何实现，以及类型强制如何集中处理。它是 VM 与 Walker 两个后端共享的地基。
 
 ## 1. 统一装箱：一切皆 `Any?`
+
+> **小白讲解**：**装箱** = 把所有类型的值都装进同一种"容器"，这样栈、数组、返回值就能用同一种类型来装。KJS 用 `Any?` 当容器。`undefined` 和 `null` 是两个不同的东西（`undefined` 是特制哨兵对象，`null` 就是空），下面代码和表格说清了。
 
 KJS（M1）不做 NaN-boxing，而是用 Kotlin 的 `Any?` 直接承载所有 JS 值，靠"类型即标签"区分：
 
@@ -50,6 +57,8 @@ object JsValues {
 > 同一个 `JsValues`，自然一致。
 
 ## 3. JsObject：属性表 + 原型链
+
+> **小白讲解**：JS 没有"类继承"那种经典机制（ES6 的 `class` 只是语法糖），对象间靠 **原型链** 串起来：访问 `obj.x` 时自己没有就顺着 `__proto__` 往上游找。下面 `get` 方法就是"沿链向上委托"的实现。 **别的方案**：有的语言直接拷贝父类属性（类式继承），JS 选"链上委托"，更省内存、支持运行时改原型。
 
 `JsObject`（`JsObject.kt:12`）是最小可用的 JS 对象：
 
@@ -119,6 +128,8 @@ class Realm {
 
 ## 5. JsFunction 与 Environment：函数与词法作用域
 
+> **小白讲解**：**Environment（环境）** 是"名字→值"的一张表，且表可一层套一层（父环境指针），对应 JS 的"作用域嵌套"：函数里能读外层变量，靠沿父环境往上找。`closure` 把这份环境封存进函数对象，函数走到哪都能找到定义时的变量——这就是 **闭包** 的实现原理。 **进阶**：和 D5 §9 的 Upvalue 盒子对照看，理解闭包捕获的两种表示。
+
 `JsFunction`（`JsFunction.kt:8`）继承 `JsObject`（`callable = this`），区分用户函数与宿主函数：
 
 ```kotlin
@@ -167,6 +178,8 @@ class Environment(val parent: Environment? = null) {
   "缓存的是拥有者 map"而非值——所以 `=` 后更新立即可见。
 
 ## 6. 设计取舍
+
+> **小白讲解**：总结本篇取舍：用 `Any?` 装箱图省事、用 `JsValues` 集中处理类型转换（保证两个后端一致）、用 `className` 当形状键驱动内联缓存。每种选择都标了代价，M2 是后续优化方向。
 
 - **`Any?` 统一装箱**：实现简单、VM/`Frame.locals` 直接复用；代价是数字也走堆对象（M2 计划换
   NaN-boxing 的 `Long`）。
